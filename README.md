@@ -6,7 +6,10 @@
 [![Node >= 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](package.json)
 [![Dependencies: 1](https://img.shields.io/badge/dependencies-1-blue.svg)](package.json)
 
+<img width="1905" height="963" alt="image" src="https://github.com/user-attachments/assets/390ccb5a-d780-494d-b484-e87378f92dfd" />
+
 OpenNotetaker sends a visible bot into your Google Meet, transcribes code-switched
+
 Hindi–English the way it is actually spoken, and turns it into clean English notes:
 summary, decisions, open questions, and action items with owners, deadlines, and
 timestamped evidence.
