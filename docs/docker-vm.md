@@ -14,19 +14,23 @@ Chrome plays meeting audio into the PulseAudio sink, and ffmpeg captures the sin
 
 ## Build And Run
 
-Create a docker env file:
+Create the config file (the same `.env` drives `npm run dev` and docker compose):
 
 ```bash
-cp .env.docker.example .env.docker
+cp .env.example .env
 ```
 
 Set at minimum:
 
 ```bash
 DEEPGRAM_API_KEY=...
-RUNNER_TOKEN=<long-random-token>
-OPENNOTETAKER_BASE_URL=http://127.0.0.1:5173
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=...
+RUNNER_TOKEN=$(openssl rand -hex 32)
 ```
+
+Container-specific values (Chromium path, PulseAudio sink, internal worker URL) are
+pinned in `docker-compose.yml`; you never set them in `.env`.
 
 Then run:
 

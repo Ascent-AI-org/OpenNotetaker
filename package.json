@@ -2,8 +2,23 @@
   "name": "open-notetaker",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
-  "description": "Hinglish-first Google Meet notetaker MVP with bot-oriented capture, transcript normalization, and action extraction.",
+  "description": "Hinglish-first Google Meet notetaker: bot capture, code-switch transcription, diarization, and action-item extraction.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ascent-AI-org/OpenNotetaker.git"
+  },
+  "keywords": [
+    "hinglish",
+    "code-switching",
+    "google-meet",
+    "meeting-notes",
+    "speech-to-text",
+    "diarization",
+    "deepgram",
+    "self-hosted"
+  ],
   "scripts": {
     "dev": "node src/server.js",
     "start": "NODE_ENV=production node src/server.js",
