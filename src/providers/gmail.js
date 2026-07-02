@@ -11,12 +11,12 @@ const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
 const CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars";
 
-export function createGmailOAuthUrl({ clientId, redirectUri, state }) {
+export function createGmailOAuthUrl({ clientId, redirectUri, state, scopes = GOOGLE_WORKSPACE_SCOPES }) {
   const url = new URL(AUTH_URL);
   url.searchParams.set("client_id", clientId);
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", GOOGLE_WORKSPACE_SCOPES.join(" "));
+  url.searchParams.set("scope", scopes.join(" "));
   url.searchParams.set("access_type", "offline");
   url.searchParams.set("prompt", "consent");
   url.searchParams.set("state", state);
@@ -68,6 +68,19 @@ export async function getGoogleTokenStatus(tokenPath) {
 
 export function tokenHasScope(token, scope) {
   return parseScopes(token).includes(scope);
+}
+
+// Identity for "Sign in with Google": the access token came straight from Google's
+// token endpoint over TLS, so userinfo is a trustworthy source of the email.
+export async function fetchGoogleUserinfo(accessToken) {
+  const response = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const body = await parseJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(body?.error_description || "Google userinfo request failed.");
+  }
+  return body;
 }
 
 export async function sendGmailMessage({ auth, tokenPath, message }) {

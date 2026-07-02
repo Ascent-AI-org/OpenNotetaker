@@ -237,6 +237,16 @@ async function boot() {
   // Invite links land here: /?invite=<code>&email=<address> prefills the
   // set-password form (the invite code is a single-use reset code).
   const params = new URLSearchParams(location.search);
+  const authErrorCode = params.get("auth_error");
+  if (authErrorCode) {
+    history.replaceState(null, "", location.pathname);
+    showAuthGate();
+    authError.textContent =
+      authErrorCode === "no_account"
+        ? "No account for that Google email — ask an admin for an invite."
+        : "Google sign-in failed. Try again or use your password.";
+    return;
+  }
   const inviteToken = params.get("invite");
   if (inviteToken) {
     history.replaceState(null, "", location.pathname);
@@ -404,6 +414,8 @@ function setAuthMode(mode) {
   authPassword.required = mode !== "forgot";
   authPasswordLabel.textContent = mode === "reset" ? "New password" : "Password";
   authPassword.autocomplete = mode === "login" ? "current-password" : "new-password";
+  const googleLogin = $("#google-login");
+  if (googleLogin) googleLogin.hidden = mode === "forgot" || mode === "reset";
 }
 
 async function handleAuthSubmit(event) {

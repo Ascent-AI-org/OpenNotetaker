@@ -37,6 +37,7 @@ import {
   createMimeMessage,
   exchangeGmailCode,
   extractGoogleMeetUrl,
+  fetchGoogleUserinfo,
   getGoogleTokenStatus,
   hasUsableGmailToken,
   listCalendarEvents,
@@ -457,12 +458,36 @@ async function route(request, response) {
 
     const state = crypto.randomUUID();
     pruneOAuthStates();
-    gmailOAuthStates.set(state, { userId: user.id, expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
+    gmailOAuthStates.set(state, { kind: "connect", userId: user.id, expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
     response.writeHead(302, {
       Location: createGmailOAuthUrl({
         clientId: config.google.clientId,
         redirectUri: config.google.redirectUri,
         state
+      })
+    });
+    response.end();
+    return;
+  }
+
+  // Google sign-in: light identity scopes, reuses the registered redirect URI. Only
+  // emails that already have an account may log in — invites stay the only door.
+  if (url.pathname === "/api/auth/google/start" && request.method === "GET") {
+    if (!isGmailConfigured()) {
+      return sendJson(response, 400, { error: "google_not_configured", message: "Google OAuth is not configured." });
+    }
+    if (!loginIpLimiter.consume(clientIp(request)).allowed) {
+      return sendJson(response, 429, { error: "rate_limited", message: "Too many attempts. Try later." });
+    }
+    const state = crypto.randomUUID();
+    pruneOAuthStates();
+    gmailOAuthStates.set(state, { kind: "login", expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
+    response.writeHead(302, {
+      Location: createGmailOAuthUrl({
+        clientId: config.google.clientId,
+        redirectUri: config.google.redirectUri,
+        state,
+        scopes: ["openid", "email", "profile"]
       })
     });
     response.end();
@@ -477,7 +502,7 @@ async function route(request, response) {
     const state = url.searchParams.get("state") || "";
     const pending = gmailOAuthStates.get(state);
     gmailOAuthStates.delete(state);
-    if (!pending || pending.expiresAt < Date.now() || !users.getUser(pending.userId)) {
+    if (!pending || pending.expiresAt < Date.now() || (pending.kind === "connect" && !users.getUser(pending.userId))) {
       return sendJson(response, 400, {
         error: "invalid_oauth_state",
         message: "Google connection state did not match. Start the connection again."
@@ -498,6 +523,23 @@ async function route(request, response) {
       redirectUri: config.google.redirectUri,
       code
     });
+
+    if (pending.kind === "login") {
+      const info = await fetchGoogleUserinfo(token.access_token).catch(() => null);
+      const email = validateEmail(info?.email);
+      const account = email && info?.email_verified !== false ? users.findUserByEmail(email) : null;
+      if (!account) {
+        response.writeHead(302, { Location: "/?auth_error=no_account" });
+        response.end();
+        return;
+      }
+      await users.updateUser(account.id, { lastLoginAt: new Date().toISOString(), lastLoginIp: clientIp(request) });
+      await startSession(request, response, account);
+      response.writeHead(302, { Location: "/" });
+      response.end();
+      return;
+    }
+
     await saveGmailToken(userGoogleTokenPath(pending.userId), token);
     // Granting calendar scope is a clear intent to import meetings, so switch the
     // per-user sync toggle on. Autostart (a bot joining unattended) stays opt-in.
