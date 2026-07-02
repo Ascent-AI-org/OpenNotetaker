@@ -126,6 +126,16 @@ npm run bot:worker
 
 `BOT_PROVIDER=external` remains for single-host local development: the web app spawns one runner child process per meeting and serializes overlapping recordings behind a queue.
 
+## Secret scanning
+
+A pre-commit hook blocks staged secrets and refuses `.env`, `data/`, and `.bot-profile/` paths outright (even force-added). Enable it once per clone:
+
+```bash
+npm run hooks
+```
+
+Install [gitleaks](https://github.com/gitleaks/gitleaks) (`brew install gitleaks`) for full-ruleset scanning; without it the hook falls back to high-signal patterns (Google/OpenAI/AWS/GitHub/Slack keys, private key blocks).
+
 ## Security notes
 
 Meeting audio and transcripts are sensitive. Before public deployment, add:
