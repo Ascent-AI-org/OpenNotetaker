@@ -11,7 +11,7 @@ export const DEFAULT_USER_SETTINGS = {
   transcriptRecipients: [],
   autoEmailTranscript: false,
   calendarSyncEnabled: false,
-  calendarAutoStart: false
+  calendarAutoStart: true
 };
 
 export class UsersStore {
