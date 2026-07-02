@@ -1,0 +1,42 @@
+services:
+  open-notetaker:
+    build: .
+    ports:
+      # Bind to localhost: the API has no user auth yet, and it can point the bot's
+      # Google account at arbitrary meetings. Put a reverse proxy with auth in front
+      # before exposing it beyond the host.
+      - "127.0.0.1:5173:5173"
+    env_file:
+      - .env.docker
+    environment:
+      BOT_PROVIDER: fleet
+    volumes:
+      - open-notetaker-data:/app/data
+    shm_size: "1gb"
+    restart: unless-stopped
+
+  # One worker records one meeting at a time. Scale concurrent recordings with:
+  #   docker compose up -d --scale open-notetaker-worker=3
+  # Each replica copies the signed-in seed profile (see docker/entrypoint.sh) into
+  # container-local storage so Chrome instances never share a live profile.
+  open-notetaker-worker:
+    build: .
+    command: ["npm", "run", "bot:worker"]
+    env_file:
+      - .env.docker
+    environment:
+      OPENNOTETAKER_BASE_URL: http://open-notetaker:5173
+      BOT_PROFILE_SEED_DIR: /seed/bot-profile
+      BOT_CHROME_USER_DATA_DIR: /app/.bot-profile-local
+    volumes:
+      - open-notetaker-bot-profile:/seed/bot-profile:ro
+    depends_on:
+      - open-notetaker
+    shm_size: "1gb"
+    # Give an in-progress recording time to finish and submit before SIGKILL.
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+volumes:
+  open-notetaker-data:
+  open-notetaker-bot-profile:

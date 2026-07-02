@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+!.env.docker.example
+data/
+.bot-profile/
+coverage/
+.DS_Store
+npm-debug.log*

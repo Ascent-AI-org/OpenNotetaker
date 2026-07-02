@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenNotetaker</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="auth-gate" class="auth-gate" hidden>
+      <div class="auth-card">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">ON</span>
+          <span class="brand-name">OpenNotetaker</span>
+        </div>
+        <div class="auth-copy">
+          <h1 id="auth-title">Sign in</h1>
+          <p class="auth-subtitle">Hinglish meeting notes with owners, deadlines, and evidence.</p>
+        </div>
+        <form id="auth-form" novalidate>
+          <div class="field" id="auth-name-field" hidden>
+            <label for="auth-name">Name</label>
+            <input id="auth-name" name="name" maxlength="80" autocomplete="name" />
+          </div>
+          <div class="field">
+            <label for="auth-email">Email</label>
+            <input id="auth-email" name="email" type="email" autocomplete="email" required />
+          </div>
+          <div class="field" id="auth-token-field" hidden>
+            <label for="auth-token">Reset code</label>
+            <input id="auth-token" name="token" autocomplete="one-time-code" />
+            <p class="field-hint">From the email we just sent you.</p>
+          </div>
+          <div class="field" id="auth-password-field">
+            <label for="auth-password" id="auth-password-label">Password</label>
+            <input id="auth-password" name="password" type="password" minlength="8" maxlength="200" autocomplete="current-password" />
+          </div>
+          <button id="auth-submit" class="btn btn-primary btn-block" type="submit">Sign in</button>
+          <p id="auth-error" class="form-error" role="alert"></p>
+          <p id="auth-notice" class="form-notice" role="status"></p>
+        </form>
+        <div class="auth-links">
+          <button id="auth-toggle" class="link-button" type="button">Need an account? Sign up</button>
+          <button id="auth-forgot" class="link-button" type="button">Forgot password?</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="app-shell" class="shell" hidden>
+      <aside class="rail">
+        <header class="rail-head">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">ON</span>
+            <span class="brand-name">OpenNotetaker</span>
+          </div>
+          <button id="new-meeting-button" class="btn btn-primary btn-sm" type="button" title="New meeting — press C">New meeting</button>
+        </header>
+        <p id="app-error" class="app-error" role="alert" hidden></p>
+        <nav class="rail-views" aria-label="Views">
+          <button id="calendar-view-button" class="rail-view" type="button">
+            <svg class="sicon" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.5" y="2.5" width="11" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M1.5 5.5 H12.5" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 1 V3.5 M9.5 1 V3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+            Calendar
+          </button>
+          <button id="team-view-button" class="rail-view" type="button" hidden>
+            <svg class="sicon" viewBox="0 0 14 14" aria-hidden="true"><circle cx="5" cy="4.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M1.5 12 C1.5 9.6 3 8.2 5 8.2 C7 8.2 8.5 9.6 8.5 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M9.2 7.1 C10.6 7.3 12.3 8.5 12.5 10.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="9.8" cy="3.8" r="1.9" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+            Team
+          </button>
+        </nav>
+        <nav id="meeting-list" class="meeting-list" aria-label="Meetings"></nav>
+        <footer class="rail-foot">
+          <button id="settings-button" class="rail-status" type="button" aria-haspopup="dialog">
+            <span id="google-dot" class="dot dot-muted" aria-hidden="true"></span>
+            <span id="google-status-label" class="rail-status-text">Checking Google&hellip;</span>
+            <span class="rail-status-action">Settings</span>
+          </button>
+          <div class="rail-user">
+            <span id="user-chip" class="user-chip"></span>
+            <button id="logout-button" class="link-button" type="button">Sign out</button>
+          </div>
+        </footer>
+      </aside>
+
+      <main id="meeting-detail" class="detail" aria-live="polite"></main>
+    </div>
+
+    <dialog id="create-dialog" class="dialog">
+      <form id="meeting-form" method="dialog" novalidate>
+        <header class="dialog-head">
+          <h2>New meeting</h2>
+          <p>The bot joins as a visible participant and keeps listening after you leave.</p>
+        </header>
+        <div class="field">
+          <label for="title">Title</label>
+          <input id="title" name="title" maxlength="120" placeholder="Client kickoff call" required />
+        </div>
+        <div class="field">
+          <label for="meetUrl">Google Meet link</label>
+          <input id="meetUrl" name="meetUrl" placeholder="https://meet.google.com/xxx-xxxx-xxx" required />
+        </div>
+        <details class="form-advanced">
+          <summary>Scheduling &amp; consent</summary>
+          <div class="form-advanced-body">
+            <div class="form-row">
+              <div class="field">
+                <label for="scheduledAt">Start time</label>
+                <input id="scheduledAt" name="scheduledAt" type="datetime-local" />
+                <p class="field-hint">Empty means now.</p>
+              </div>
+              <div class="field">
+                <label for="retentionDays">Retention (days)</label>
+                <input id="retentionDays" name="retentionDays" type="number" min="1" max="365" value="30" />
+              </div>
+            </div>
+            <div class="field">
+              <label for="consentMode">Recording consent</label>
+              <select id="consentMode" name="consentMode">
+                <option value="host_confirmed">Host confirmed</option>
+                <option value="all_participants">All participants</option>
+                <option value="internal_policy">Internal policy</option>
+              </select>
+            </div>
+          </div>
+        </details>
+        <p id="form-error" class="form-error" role="alert"></p>
+        <footer class="dialog-actions">
+          <button type="button" class="btn btn-ghost" data-close-dialog>Cancel</button>
+          <button id="create-button" class="btn btn-primary" type="submit">Create meeting</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="settings-dialog" class="dialog dialog-wide">
+      <header class="dialog-head dialog-head-row">
+        <h2>Settings</h2>
+        <button type="button" class="btn btn-ghost btn-sm" data-close-dialog>Done</button>
+      </header>
+
+      <section class="settings-section">
+        <h3>Google account</h3>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <p id="gmail-status-text" class="settings-status">Checking Gmail&hellip;</p>
+            <p id="gmail-recipient-text" class="settings-hint"></p>
+          </div>
+          <a id="gmail-connect" class="btn btn-secondary btn-sm" href="/api/gmail/oauth/start">Connect</a>
+        </div>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <p id="calendar-status-text" class="settings-status">Checking Calendar&hellip;</p>
+            <p id="calendar-meta-text" class="settings-hint"></p>
+          </div>
+          <button id="calendar-sync" class="btn btn-secondary btn-sm" type="button">Sync now</button>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Notes delivery</h3>
+        <div class="field">
+          <label for="settings-recipients">Email transcripts to</label>
+          <input id="settings-recipients" placeholder="Defaults to your account email" />
+          <p class="field-hint">Comma separated. Sent from your connected Gmail.</p>
+        </div>
+        <label class="switch-line">
+          <input type="checkbox" id="settings-auto-email" />
+          <span>Email notes automatically when a meeting finishes</span>
+        </label>
+        <label class="switch-line">
+          <input type="checkbox" id="settings-calendar-sync" />
+          <span>Import my Google Calendar meetings</span>
+        </label>
+        <label class="switch-line">
+          <input type="checkbox" id="settings-calendar-autostart" />
+          <span>Send the bot automatically when a meeting starts</span>
+        </label>
+        <div class="settings-actions">
+          <button id="settings-save" class="btn btn-primary btn-sm" type="button">Save</button>
+          <p id="settings-status" class="settings-hint" role="status"></p>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Password</h3>
+        <div class="form-row">
+          <div class="field">
+            <label for="password-current">Current password</label>
+            <input id="password-current" type="password" autocomplete="current-password" />
+          </div>
+          <div class="field">
+            <label for="password-new">New password</label>
+            <input id="password-new" type="password" minlength="8" maxlength="200" autocomplete="new-password" />
+          </div>
+        </div>
+        <div class="settings-actions">
+          <button id="password-change" class="btn btn-secondary btn-sm" type="button">Change password</button>
+          <p id="password-status" class="settings-hint" role="status"></p>
+        </div>
+      </section>
+    </dialog>
+
+    <dialog id="team-dialog" class="dialog dialog-wide">
+      <header class="dialog-head dialog-head-row">
+        <h2>Team</h2>
+        <button type="button" class="btn btn-ghost btn-sm" data-close-dialog>Done</button>
+      </header>
+      <section class="settings-section">
+        <h3>Invite a teammate</h3>
+        <div class="form-row">
+          <div class="field">
+            <label for="invite-email">Email</label>
+            <input id="invite-email" type="email" placeholder="teammate@company.com" />
+          </div>
+          <div class="field">
+            <label for="invite-name">Name (optional)</label>
+            <input id="invite-name" maxlength="80" />
+          </div>
+        </div>
+        <div class="settings-actions">
+          <button id="invite-send" class="btn btn-primary btn-sm" type="button">Create invite</button>
+          <p id="invite-status" class="settings-hint" role="status"></p>
+        </div>
+        <div id="invite-result" class="invite-result" hidden>
+          <p class="settings-hint">Send them this link — it lets them set a password (valid 7 days, single use):</p>
+          <div class="invite-link-row">
+            <input id="invite-link" readonly />
+            <button id="invite-copy" class="btn btn-secondary btn-sm" type="button">Copy</button>
+          </div>
+        </div>
+      </section>
+      <section class="settings-section">
+        <h3>Members</h3>
+        <div id="team-list" class="team-list"></div>
+      </section>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
