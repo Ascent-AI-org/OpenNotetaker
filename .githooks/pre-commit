@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-commit secret scan. Blocks commits that stage secret-bearing paths or content.
+# Full coverage needs gitleaks (brew install gitleaks); without it a high-signal
+# regex fallback still runs. Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+
+# These paths hold live credentials in this repo; refuse them even when force-added.
+BLOCKED=$(git diff --cached --name-only | grep -E '^(\.env(\..+)?$|data/|\.bot-profile/)' | grep -vE '\.example$' || true)
+if [ -n "$BLOCKED" ]; then
+  echo "pre-commit: refusing to commit secret-bearing paths:" >&2
+  echo "$BLOCKED" >&2
+  exit 1
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --redact
+else
+  MATCHES=$(git diff --cached -U0 | grep -E '^\+' | grep -cE 'GOCSPX-[A-Za-z0-9_-]{10,}|AQ\.[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}|-----BEGIN( RSA| EC| OPENSSH)? PRIVATE KEY|[0-9]{12}-[a-z0-9]{32}\.apps\.googleusercontent\.com|xox[baprs]-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}' || true)
+  if [ "${MATCHES:-0}" -gt 0 ]; then
+    echo "pre-commit: staged content matches $MATCHES secret pattern(s). Commit blocked." >&2
+    echo "Install gitleaks (brew install gitleaks) for detailed, redacted findings." >&2
+    exit 1
+  fi
+  echo "pre-commit: fallback secret scan passed (install gitleaks for full coverage)."
+fi
