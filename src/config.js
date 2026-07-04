@@ -98,6 +98,7 @@ export function readConfig() {
         model: process.env.GEMINI_MODEL || "gemini-3-flash-preview",
         normalizeChunkSize: parsePositiveInt(process.env.GEMINI_NORMALIZE_CHUNK_SIZE, 18),
         reconstructChunkSize: parsePositiveInt(process.env.GEMINI_RECONSTRUCT_CHUNK_SIZE, 48),
+        notesChunkSize: parsePositiveInt(process.env.GEMINI_NOTES_CHUNK_SIZE, 200),
         requestTimeoutMs: parsePositiveInt(process.env.GEMINI_REQUEST_TIMEOUT_MS, 90_000),
         maxRetries: parseNonNegativeInt(process.env.GEMINI_MAX_RETRIES, 2)
       }

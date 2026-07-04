@@ -1041,6 +1041,109 @@ test("pipeline still produces notes when speaker reconstruction throws", async (
   assert.ok(events.includes("notes.ready"));
 });
 
+test("Gemini extracts notes in one call for a short meeting", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      async json() {
+        return {
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      summary: "Short meeting.",
+                      detailedNotes: ["One note."],
+                      decisions: [],
+                      actionItems: [],
+                      openQuestions: [],
+                      risks: []
+                    })
+                  }
+                ]
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+
+  try {
+    const provider = new GeminiProvider({ apiKey: "test-key", model: "gemini-test" });
+    const notes = await provider.extractNotes({
+      roles: [],
+      turns: Array.from({ length: 5 }, (_, index) => ({ id: `turn-${index}`, text: `line ${index}` }))
+    });
+    assert.equal(calls, 1, "a short meeting is a single notes call");
+    assert.equal(notes.summary, "Short meeting.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Gemini extracts notes by map-reduce for a long meeting and dedupes across chunks", async () => {
+  const originalFetch = globalThis.fetch;
+  let mapCalls = 0;
+  let reduceCalls = 0;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const prompt = body.contents[0].parts[0].text;
+    const okJson = (value) => ({
+      ok: true,
+      async json() {
+        return { candidates: [{ content: { parts: [{ text: JSON.stringify(value) }] } }] };
+      }
+    });
+
+    if (/ordered section summaries/i.test(prompt)) {
+      reduceCalls += 1;
+      const payload = JSON.parse(prompt.slice(prompt.indexOf("{")));
+      assert.ok(Array.isArray(payload.sectionSummaries) && payload.sectionSummaries.length > 1);
+      return okJson({ summary: "One combined summary." });
+    }
+
+    mapCalls += 1;
+    const payload = JSON.parse(prompt.slice(prompt.indexOf("{")));
+    const firstId = (payload.turns || payload.segments || [])[0]?.id;
+    return okJson({
+      summary: `Section ${firstId}`,
+      detailedNotes: [`Detail ${firstId}`, "Shared detail"],
+      decisions: ["Shared decision"],
+      actionItems: [
+        { task: `Task ${firstId}`, owner: "Unknown", due: "Not stated", evidenceSegmentIds: [] },
+        { task: "Shared task", owner: "Unknown", due: "Not stated", evidenceSegmentIds: [] }
+      ],
+      openQuestions: [],
+      risks: []
+    });
+  };
+
+  try {
+    const provider = new GeminiProvider({ apiKey: "test-key", model: "gemini-test", notesChunkSize: 40 });
+    const turns = Array.from({ length: 90 }, (_, index) => ({ id: `seg-${index + 1}`, text: `line ${index + 1}` }));
+    const notes = await provider.extractNotes({ roles: [], turns });
+
+    assert.equal(mapCalls, 3, "90 turns at chunk size 40 → three map calls");
+    assert.equal(reduceCalls, 1, "one summary reduction call");
+    assert.equal(notes.summary, "One combined summary.");
+    // List fields are concatenated across chunks and de-duplicated.
+    assert.deepEqual(notes.decisions, ["Shared decision"]);
+    assert.equal(notes.detailedNotes.filter((note) => note === "Shared detail").length, 1);
+    assert.equal(notes.actionItems.filter((item) => item.task === "Shared task").length, 1);
+    assert.deepEqual(
+      notes.actionItems.map((item) => item.task).filter((task) => task.startsWith("Task ")),
+      ["Task seg-1", "Task seg-41", "Task seg-81"]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("repairs reconstructed transcript role ids and unsafe values", () => {
   const repaired = repairReconstructedTranscript({
     roles: [{ id: "vendor", label: "Ostrya / Sanya" }],

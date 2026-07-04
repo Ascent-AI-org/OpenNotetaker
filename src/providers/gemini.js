@@ -17,13 +17,38 @@ import {
 // normalization chunk carries the tail of the previous chunk as read-only context.
 const NORMALIZE_CONTEXT_SEGMENTS = 3;
 
+// Used to fold per-chunk summaries of a long meeting into a single summary.
+const SUMMARY_REDUCE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["summary"],
+  properties: { summary: { type: "string" } }
+};
+
+const SUMMARY_REDUCE_INSTRUCTIONS =
+  "These are ordered section summaries of one long meeting. Combine them into a single, concise summary " +
+  "(3-6 sentences) covering the main topics, decisions, and outcomes in chronological order. " +
+  "Do not add any facts that are not present in the section summaries.";
+
 export class GeminiProvider {
-  constructor({ apiKey, model, normalizeChunkSize = 18, reconstructChunkSize = 48, requestTimeoutMs = 90_000, maxRetries = 2 }) {
+  constructor({
+    apiKey,
+    model,
+    normalizeChunkSize = 18,
+    reconstructChunkSize = 48,
+    notesChunkSize = 200,
+    requestTimeoutMs = 90_000,
+    maxRetries = 2
+  }) {
     if (!apiKey) throw new Error("GeminiProvider requires an API key.");
     this.apiKey = apiKey;
     this.model = model || "gemini-3-flash-preview";
     this.normalizeChunkSize = Math.max(1, Number(normalizeChunkSize) || 18);
     this.reconstructChunkSize = Math.max(8, Number(reconstructChunkSize) || 48);
+    // Notes extraction over a very long meeting in one call risks both the request
+    // timeout and token limits, so a large transcript is summarized chunk-by-chunk and
+    // merged. Small meetings (the common case) stay a single call.
+    this.notesChunkSize = Math.max(40, Number(notesChunkSize) || 200);
     this.requestTimeoutMs = Math.max(1000, Number(requestTimeoutMs) || 90_000);
     // Retries cover transient failures (timeouts, 429, 5xx). A single slow chunk out
     // of dozens on a long meeting is almost always a latency spike, not a fatal error.
@@ -67,11 +92,70 @@ export class GeminiProvider {
     return response.segments;
   }
 
-  async extractNotes(normalizedSegments, { participants = [] } = {}) {
+  async extractNotes(notesSource, { participants = [] } = {}) {
+    const { units, wrap } = notesUnits(notesSource);
+    if (units.length <= this.notesChunkSize) {
+      return this.extractNotesBatch(notesSource, { participants });
+    }
+
+    // Map: partial notes per chunk of the transcript. One chunk failing after retries
+    // costs that section's notes (recorded as a risk), not the whole meeting.
+    const chunks = chunkArray(units, this.notesChunkSize);
+    const partials = [];
+    for (const [index, chunk] of chunks.entries()) {
+      try {
+        partials.push(await this.extractNotesBatch(wrap(chunk), { participants }));
+      } catch (error) {
+        console.warn(`Gemini notes chunk ${index + 1}/${chunks.length} failed; skipping that section: ${error.message}`);
+        partials.push({
+          summary: "",
+          detailedNotes: [],
+          decisions: [],
+          actionItems: [],
+          openQuestions: [],
+          risks: [`Notes extraction failed for one transcript section: ${error.message}`]
+        });
+      }
+    }
+    return this.reduceNotes(partials, { participants });
+  }
+
+  async extractNotesBatch(notesSource, { participants = [] } = {}) {
     return this.createJsonResponse({
       schema: NOTES_SCHEMA,
-      prompt: NOTES_INSTRUCTIONS + participantsNote(participants) + "\n\n" + JSON.stringify(normalizedSegments)
+      prompt: NOTES_INSTRUCTIONS + participantsNote(participants) + "\n\n" + JSON.stringify(notesSource)
     });
+  }
+
+  // Reduce: dedupe the list fields across chunks and combine the per-chunk summaries
+  // into one coherent summary (a small, fast call). Falls back to concatenation if the
+  // summary reduction itself fails.
+  async reduceNotes(partials, { participants = [] } = {}) {
+    const detailedNotes = dedupeStrings(partials.flatMap((partial) => partial?.detailedNotes || []));
+    const decisions = dedupeStrings(partials.flatMap((partial) => partial?.decisions || []));
+    const openQuestions = dedupeStrings(partials.flatMap((partial) => partial?.openQuestions || []));
+    const risks = dedupeStrings(partials.flatMap((partial) => partial?.risks || []));
+    const actionItems = dedupeActionItems(partials.flatMap((partial) => partial?.actionItems || []));
+    const sectionSummaries = partials.map((partial) => cleanText(partial?.summary)).filter(Boolean);
+
+    let summary = sectionSummaries.join(" ");
+    if (sectionSummaries.length > 1) {
+      try {
+        const reduced = await this.createJsonResponse({
+          schema: SUMMARY_REDUCE_SCHEMA,
+          prompt:
+            SUMMARY_REDUCE_INSTRUCTIONS +
+            participantsNote(participants) +
+            "\n\n" +
+            JSON.stringify({ sectionSummaries })
+        });
+        if (cleanText(reduced?.summary)) summary = reduced.summary.trim();
+      } catch (error) {
+        console.warn(`Gemini notes summary reduction failed; using concatenated section summaries: ${error.message}`);
+      }
+    }
+
+    return { summary, detailedNotes, decisions, actionItems, openQuestions, risks };
   }
 
   async verifyActionItems({ transcript, notes }, { participants = [] } = {}) {
@@ -246,6 +330,55 @@ function passthroughReconstruction(segments, error) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The notes source is either a reconstructed transcript ({roles, turns}), a normalized
+// wrapper ({segments}), or a bare array. Return the units to chunk and a wrapper that
+// rebuilds the same shape (preserving roles for context) for a chunk of those units.
+function notesUnits(source) {
+  if (Array.isArray(source?.turns)) {
+    const roles = source.roles || [];
+    return { units: source.turns, wrap: (chunk) => ({ roles, turns: chunk }) };
+  }
+  if (Array.isArray(source?.segments)) {
+    return { units: source.segments, wrap: (chunk) => ({ segments: chunk }) };
+  }
+  if (Array.isArray(source)) {
+    return { units: source, wrap: (chunk) => chunk };
+  }
+  return { units: [], wrap: () => source };
+}
+
+function dedupeStrings(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const text = cleanText(value);
+    const key = text.toLowerCase();
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+  }
+  return result;
+}
+
+function dedupeActionItems(items) {
+  const seen = new Set();
+  const result = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const task = cleanText(item.task);
+    if (!task) continue;
+    const key = task.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+function cleanText(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function mergeRoles(existingRoles, newRoles) {
