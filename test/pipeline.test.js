@@ -1110,6 +1110,95 @@ test("re-finalizing an unchanged transcript reuses the stored normalization", as
   assert.match(normalizedEvent.message, /Reused the existing English normalization/);
 });
 
+test("normalization reuse tolerates minor id drift but re-normalizes a different transcript", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "open-notetaker-reuse2-"));
+  const store = new JsonStore(join(dir, "data", "meetings.json"));
+  await store.load();
+
+  const rawSegments = Array.from({ length: 10 }, (_, index) => ({
+    id: `seg-${index + 1}`,
+    speaker: "Speaker 1",
+    start: index,
+    end: index + 1,
+    text: `line ${index + 1}`
+  }));
+  const makeProvider = (onNormalize) => ({
+    async normalizeSegments(segments) {
+      onNormalize();
+      return segments.map((segment) => ({
+        id: segment.id,
+        speaker: segment.speaker,
+        start: segment.start,
+        end: segment.end,
+        raw: segment.text,
+        english: `English ${segment.id}`,
+        confidence: "high",
+        uncertainTerms: []
+      }));
+    },
+    async reconstructTranscript() {
+      return null;
+    },
+    async extractNotes() {
+      return { summary: "", detailedNotes: [], decisions: [], actionItems: [], openQuestions: [], risks: [] };
+    },
+    async verifyActionItems({ notes }) {
+      return { actionItems: notes.actionItems, warnings: [] };
+    }
+  });
+
+  // 9 of 10 ids match (0.9 overlap): treated as the same transcript, so reuse.
+  const drifted = await store.createMeeting({
+    title: "Drifted",
+    meetUrl: "https://meet.google.com/abc-defg-hij",
+    scheduledAt: new Date().toISOString(),
+    consentMode: "host_confirmed",
+    retentionDays: 30
+  });
+  await store.updateMeeting(drifted.id, {
+    artifacts: {
+      normalizedSegments: rawSegments.map((segment, index) => ({
+        ...segment,
+        id: index === 0 ? "drifted-id" : segment.id,
+        english: `English ${segment.id}`
+      }))
+    }
+  });
+  let driftedNormalizeCalls = 0;
+  await processRawSegments({
+    meeting: drifted,
+    store,
+    llmProvider: makeProvider(() => (driftedNormalizeCalls += 1)),
+    rawSegments
+  });
+  assert.equal(driftedNormalizeCalls, 0, "minor id drift still reuses the stored normalization");
+
+  // A completely different stored normalization (no id overlap): must re-normalize.
+  const different = await store.createMeeting({
+    title: "Different",
+    meetUrl: "https://meet.google.com/abc-defg-hij",
+    scheduledAt: new Date().toISOString(),
+    consentMode: "host_confirmed",
+    retentionDays: 30
+  });
+  await store.updateMeeting(different.id, {
+    artifacts: {
+      normalizedSegments: Array.from({ length: 10 }, (_, index) => ({
+        id: `other-${index}`,
+        english: "unrelated"
+      }))
+    }
+  });
+  let differentNormalizeCalls = 0;
+  await processRawSegments({
+    meeting: different,
+    store,
+    llmProvider: makeProvider(() => (differentNormalizeCalls += 1)),
+    rawSegments
+  });
+  assert.equal(differentNormalizeCalls, 1, "a different transcript is normalized fresh");
+});
+
 test("Gemini extracts notes in one call for a short meeting", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;

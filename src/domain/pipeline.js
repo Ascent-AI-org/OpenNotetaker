@@ -299,14 +299,19 @@ export async function copyRecordingArtifacts({ store, from, toId }) {
   });
 }
 
-// True when a stored normalization corresponds exactly to this raw transcript (same
-// segment ids), so it can be reused instead of re-running the normalization pass.
+// True when a stored normalization clearly corresponds to this raw transcript, so it
+// can be reused instead of re-running the expensive normalization pass. Segment ids are
+// UUIDs, so a different transcript overlaps ~0% — but chunked LLM normalization can drift
+// a handful of ids across a long meeting, so require strong overlap, not an exact match.
 function normalizationCovers(normalizedSegments, rawSegments) {
-  if (!Array.isArray(normalizedSegments) || normalizedSegments.length !== rawSegments.length) {
+  if (!Array.isArray(normalizedSegments) || !normalizedSegments.length || !rawSegments.length) {
     return false;
   }
   const normalizedIds = new Set(normalizedSegments.map((segment) => segment.id));
-  return rawSegments.every((segment) => normalizedIds.has(segment.id));
+  const covered = rawSegments.filter((segment) => normalizedIds.has(segment.id)).length;
+  const overlap = covered / rawSegments.length;
+  const countRatio = normalizedSegments.length / rawSegments.length;
+  return overlap >= 0.9 && countRatio >= 0.9 && countRatio <= 1.1;
 }
 
 function delay(ms) {
