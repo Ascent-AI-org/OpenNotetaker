@@ -1,11 +1,16 @@
 import { readFileSync } from "node:fs";
 import { readConfig } from "../src/config.js";
-import { GeminiProvider } from "../src/providers/gemini.js";
+
+// Re-finalize a meeting whose recording was captured but whose notes never completed
+// (e.g. an old finalization failure). This resubmits the stored raw transcript through
+// the same server endpoint a recording worker uses, so the current server-side pipeline
+// (resilient reconstruction, chunked notes) runs and the server owns the status
+// transitions. Run it from the repo root, or inside the web container:
+//   node scripts/finalize-stuck-meeting.mjs <meeting-id> [base-url]
 
 const args = process.argv.slice(2);
 const meetingId = args.find((arg) => !arg.startsWith("--"));
 const baseUrl = args.find((arg) => /^https?:\/\//u.test(arg)) || "http://127.0.0.1:5173";
-const forceReconstruct = args.includes("--force-reconstruct");
 
 if (!meetingId) {
   throw new Error("Usage: node scripts/finalize-stuck-meeting.mjs <meeting-id> [base-url]");
@@ -22,94 +27,38 @@ if (!meeting) {
   throw new Error(`Meeting ${meetingId} was not found.`);
 }
 
-let normalizedSegments = meeting.artifacts?.normalizedSegments || [];
-if (!normalizedSegments.length) {
-  throw new Error(`Meeting ${meetingId} does not have normalized segments yet.`);
+const rawSegments = meeting.artifacts?.rawSegments || [];
+if (!rawSegments.length) {
+  throw new Error(`Meeting ${meetingId} has no captured raw transcript to finalize.`);
 }
 
-const provider = new GeminiProvider(config.llm.gemini);
-console.log(
-  JSON.stringify({
-    step: "start",
-    meetingId,
-    normalizedSegments: normalizedSegments.length
-  })
-);
+console.log(JSON.stringify({ step: "submit", meetingId, rawSegments: rawSegments.length }));
 
-const reconstructedTranscript =
-  !forceReconstruct && meeting.artifacts?.reconstructedTranscript?.turns?.length
-    ? meeting.artifacts.reconstructedTranscript
-    : await provider.reconstructTranscript(normalizedSegments);
-
-console.log(
-  JSON.stringify({
-    step: "reconstructed",
-    turns: reconstructedTranscript.turns.length,
-    roles: reconstructedTranscript.roles.length
-  })
-);
-
-await patchMeeting({
-  status: "reconstructing",
-  statusMessage: "Speaker labels repaired into stable meeting roles.",
-  artifacts: { reconstructedTranscript }
+// The server merges these with anything already stored and re-runs finalization async.
+const accepted = await api(`/api/runner/meetings/${meetingId}/raw-transcript`, {
+  method: "POST",
+  headers: authorizedJsonHeaders(),
+  body: JSON.stringify({ rawSegments })
 });
-await appendEvent("transcript.reconstructed", `${reconstructedTranscript.turns.length} role-corrected turns created.`);
+console.log(JSON.stringify({ step: "accepted", ...accepted }));
 
-let notes;
-try {
-  notes = meeting.artifacts?.notes || await provider.extractNotes(reconstructedTranscript);
-} catch (error) {
-  notes = createFallbackNotes(error);
-}
-console.log(
-  JSON.stringify({
-    step: "notes",
-    actions: notes.actionItems.length,
-    fallback: notes.source === "fallback"
-  })
-);
-
-await patchMeeting({
-  status: "completed",
-  statusMessage: "Summary and action items are ready.",
-  artifacts: { reconstructedTranscript, notes }
-});
-await appendEvent("notes.ready", `${notes.actionItems.length} action items extracted.`);
-
-const delivery = await api(`/api/meetings/${meetingId}/email-transcript`, { method: "POST" });
-console.log(
-  JSON.stringify({
-    step: "email",
-    delivery: delivery.delivery,
-    emailStatus: delivery.meeting?.delivery?.transcriptEmail || null
-  })
-);
-
-async function appendEvent(type, message) {
-  return api(`/api/runner/meetings/${meetingId}/events`, {
-    method: "POST",
-    headers: authorizedJsonHeaders(),
-    body: JSON.stringify({ type, message })
-  });
+// Poll until the server finishes (or fails) finalizing. Notes generation over a long
+// meeting makes many LLM calls, so allow several minutes.
+let status = meeting.status;
+let statusMessage = "";
+for (let attempt = 0; attempt < 120; attempt += 1) {
+  await delay(5000);
+  const current = await api(`/api/runner/meetings/${meetingId}`, { headers: authorizedJsonHeaders() });
+  status = current.meeting?.status || "";
+  statusMessage = current.meeting?.statusMessage || "";
+  const actionItems = current.meeting?.artifacts?.notes?.actionItems?.length ?? null;
+  console.log(JSON.stringify({ step: "poll", status, statusMessage, actionItems }));
+  if (status === "completed" || status === "failed") break;
 }
 
-async function patchMeeting(patch) {
-  return api(`/api/runner/meetings/${meetingId}`, {
-    method: "PATCH",
-    headers: authorizedJsonHeaders(),
-    body: JSON.stringify(patch)
-  });
-}
-
-async function api(path, options = {}) {
-  const response = await fetch(`${baseUrl}${path}`, options);
-  const text = await response.text();
-  const body = parseJson(text);
-  if (!response.ok) {
-    throw new Error(`${options.method || "GET"} ${path} failed ${response.status}: ${JSON.stringify(body)}`);
-  }
-  return body;
+console.log(JSON.stringify({ step: "done", status, statusMessage }));
+if (status !== "completed") {
+  process.exitCode = 1;
 }
 
 function authorizedJsonHeaders() {
@@ -117,6 +66,16 @@ function authorizedJsonHeaders() {
     Authorization: `Bearer ${config.runner.token}`,
     "Content-Type": "application/json"
   };
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(`${baseUrl}${path}`, options);
+  const text = await response.text();
+  const body = parseJson(text);
+  if (!response.ok) {
+    throw new Error(`${options.method || "GET"} ${path} failed ${response.status}: ${text}`);
+  }
+  return body;
 }
 
 function parseJson(text) {
@@ -127,18 +86,6 @@ function parseJson(text) {
   }
 }
 
-function createFallbackNotes(error) {
-  return {
-    source: "fallback",
-    summary:
-      "The meeting transcript was captured and converted to clean English, but automated notes extraction did not complete. Review the role-corrected and clean transcript sections below.",
-    actionItems: [],
-    decisions: [],
-    openQuestions: [
-      "Automated notes extraction failed; review the transcript evidence manually."
-    ],
-    risks: [
-      `Notes extraction failed: ${error.message}`
-    ]
-  };
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
