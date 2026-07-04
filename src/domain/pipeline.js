@@ -70,26 +70,40 @@ export async function processRawSegments({ meeting, store, llmProvider, rawSegme
     status: "normalizing",
     statusMessage: "Converting Hinglish transcript into clean English."
   });
-  const normalizedOutput = await llmProvider.normalizeSegments(rawSegments, { participants });
-  // The normalization schema does not include speakerHints; re-attach them from the
-  // raw segments by id so speaker evidence survives into reconstruction.
-  const hintsById = new Map(
-    rawSegments
-      .filter((segment) => Array.isArray(segment.speakerHints) && segment.speakerHints.length)
-      .map((segment) => [segment.id, segment.speakerHints])
-  );
-  const normalizedSegments = normalizedOutput.map((segment) =>
-    hintsById.has(segment.id) ? { ...segment, speakerHints: hintsById.get(segment.id) } : segment
-  );
-  await store.updateMeeting(meeting.id, {
-    status: "normalizing",
-    statusMessage: "Hinglish transcript converted into clean English.",
-    artifacts: { normalizedSegments }
-  });
-  await store.appendEvent(meeting.id, {
-    type: "transcript.normalized",
-    message: "English normalization pass completed."
-  });
+
+  // Normalization is the most expensive pass (one LLM call per ~18 segments). When we
+  // re-finalize an unchanged transcript — recovering a finalization failure or a user
+  // pressing Retry — reuse the stored normalization instead of paying to redo it.
+  let normalizedSegments;
+  const priorNormalized = storedMeeting?.artifacts?.normalizedSegments || [];
+  if (normalizationCovers(priorNormalized, rawSegments)) {
+    normalizedSegments = priorNormalized;
+    await store.appendEvent(meeting.id, {
+      type: "transcript.normalized",
+      message: "Reused the existing English normalization for this transcript."
+    });
+  } else {
+    const normalizedOutput = await llmProvider.normalizeSegments(rawSegments, { participants });
+    // The normalization schema does not include speakerHints; re-attach them from the
+    // raw segments by id so speaker evidence survives into reconstruction.
+    const hintsById = new Map(
+      rawSegments
+        .filter((segment) => Array.isArray(segment.speakerHints) && segment.speakerHints.length)
+        .map((segment) => [segment.id, segment.speakerHints])
+    );
+    normalizedSegments = normalizedOutput.map((segment) =>
+      hintsById.has(segment.id) ? { ...segment, speakerHints: hintsById.get(segment.id) } : segment
+    );
+    await store.updateMeeting(meeting.id, {
+      status: "normalizing",
+      statusMessage: "Hinglish transcript converted into clean English.",
+      artifacts: { normalizedSegments }
+    });
+    await store.appendEvent(meeting.id, {
+      type: "transcript.normalized",
+      message: "English normalization pass completed."
+    });
+  }
 
   await delay(stepDelayMs);
   // Speaker/role reconstruction is an enhancement: it relabels "Speaker 1/2/3" into
@@ -283,6 +297,16 @@ export async function copyRecordingArtifacts({ store, from, toId }) {
       notes: from.artifacts?.notes || null
     }
   });
+}
+
+// True when a stored normalization corresponds exactly to this raw transcript (same
+// segment ids), so it can be reused instead of re-running the normalization pass.
+function normalizationCovers(normalizedSegments, rawSegments) {
+  if (!Array.isArray(normalizedSegments) || normalizedSegments.length !== rawSegments.length) {
+    return false;
+  }
+  const normalizedIds = new Set(normalizedSegments.map((segment) => segment.id));
+  return rawSegments.every((segment) => normalizedIds.has(segment.id));
 }
 
 function delay(ms) {

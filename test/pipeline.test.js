@@ -1041,6 +1041,75 @@ test("pipeline still produces notes when speaker reconstruction throws", async (
   assert.ok(events.includes("notes.ready"));
 });
 
+test("re-finalizing an unchanged transcript reuses the stored normalization", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "open-notetaker-reuse-"));
+  const store = new JsonStore(join(dir, "data", "meetings.json"));
+  await store.load();
+  const meeting = await store.createMeeting({
+    title: "Reuse normalization",
+    meetUrl: "https://meet.google.com/abc-defg-hij",
+    scheduledAt: new Date().toISOString(),
+    consentMode: "host_confirmed",
+    retentionDays: 30
+  });
+  const rawSegments = [
+    { id: "seg-1", speaker: "Speaker 1", start: 0, end: 2, text: "haan kal tak" },
+    { id: "seg-2", speaker: "Speaker 2", start: 2, end: 4, text: "theek hai" }
+  ];
+  // A previous successful normalization is already stored for exactly these segments.
+  await store.updateMeeting(meeting.id, {
+    artifacts: {
+      normalizedSegments: rawSegments.map((segment) => ({
+        id: segment.id,
+        speaker: segment.speaker,
+        start: segment.start,
+        end: segment.end,
+        raw: segment.text,
+        english: `English ${segment.id}`,
+        confidence: "high",
+        uncertainTerms: []
+      }))
+    }
+  });
+
+  const provider = {
+    async normalizeSegments() {
+      throw new Error("normalization must not run when a valid one is already stored");
+    },
+    async reconstructTranscript(segments) {
+      return {
+        roles: [],
+        turns: segments.map((segment, index) => ({
+          id: `turn-${index}`,
+          role: "Role",
+          start: segment.start,
+          end: segment.end,
+          text: segment.english || segment.text || "",
+          sourceSegmentIds: [segment.id],
+          confidence: "medium",
+          flags: []
+        })),
+        warnings: []
+      };
+    },
+    async extractNotes() {
+      return { summary: "S", detailedNotes: [], decisions: [], actionItems: [], openQuestions: [], risks: [] };
+    },
+    async verifyActionItems({ notes }) {
+      return { actionItems: notes.actionItems, warnings: [] };
+    }
+  };
+
+  const completed = await processRawSegments({ meeting, store, llmProvider: provider, rawSegments });
+  assert.equal(completed.status, "completed");
+  const events = store.getMeeting(meeting.id).events.map((event) => event.type);
+  assert.ok(events.includes("transcript.normalized"));
+  const normalizedEvent = store
+    .getMeeting(meeting.id)
+    .events.find((event) => event.type === "transcript.normalized");
+  assert.match(normalizedEvent.message, /Reused the existing English normalization/);
+});
+
 test("Gemini extracts notes in one call for a short meeting", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
