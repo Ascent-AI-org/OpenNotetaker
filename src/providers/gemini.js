@@ -18,13 +18,16 @@ import {
 const NORMALIZE_CONTEXT_SEGMENTS = 3;
 
 export class GeminiProvider {
-  constructor({ apiKey, model, normalizeChunkSize = 18, reconstructChunkSize = 48, requestTimeoutMs = 90_000 }) {
+  constructor({ apiKey, model, normalizeChunkSize = 18, reconstructChunkSize = 48, requestTimeoutMs = 90_000, maxRetries = 2 }) {
     if (!apiKey) throw new Error("GeminiProvider requires an API key.");
     this.apiKey = apiKey;
     this.model = model || "gemini-3-flash-preview";
     this.normalizeChunkSize = Math.max(1, Number(normalizeChunkSize) || 18);
     this.reconstructChunkSize = Math.max(8, Number(reconstructChunkSize) || 48);
     this.requestTimeoutMs = Math.max(1000, Number(requestTimeoutMs) || 90_000);
+    // Retries cover transient failures (timeouts, 429, 5xx). A single slow chunk out
+    // of dozens on a long meeting is almost always a latency spike, not a fatal error.
+    this.maxRetries = Math.max(0, Number.isFinite(Number(maxRetries)) ? Number(maxRetries) : 2);
   }
 
   async normalizeSegments(rawSegments, { participants = [] } = {}) {
@@ -92,14 +95,25 @@ export class GeminiProvider {
     };
 
     for (const [index, chunk] of chunks.entries()) {
-      const response = await this.reconstructTranscriptBatch({
-        segments: chunk,
-        existingRoles: combined.roles,
-        chunkIndex: index,
-        totalChunks: chunks.length,
-        participants
-      });
-      const repaired = repairReconstructedTranscript(response);
+      let repaired;
+      try {
+        const response = await this.reconstructTranscriptBatch({
+          segments: chunk,
+          existingRoles: combined.roles,
+          chunkIndex: index,
+          totalChunks: chunks.length,
+          participants
+        });
+        repaired = repairReconstructedTranscript(response);
+      } catch (error) {
+        // One chunk failing after retries must not lose the whole meeting's transcript.
+        // Pass this section through with its normalized speaker labels and flag it, so a
+        // single slow window costs one section's role-repair, not the entire recording.
+        console.warn(
+          `Gemini reconstruct chunk ${index + 1}/${chunks.length} failed; passing it through unrepaired: ${error.message}`
+        );
+        repaired = passthroughReconstruction(chunk, error);
+      }
       combined.roles = mergeRoles(combined.roles, repaired.roles);
       combined.turns.push(...repaired.turns);
       combined.warnings.push(...repaired.warnings);
@@ -134,6 +148,26 @@ export class GeminiProvider {
   }
 
   async createJsonResponse({ schema, prompt }) {
+    let lastError;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+      try {
+        return await this.attemptJsonResponse({ schema, prompt });
+      } catch (error) {
+        lastError = error;
+        // Non-transient failures (4xx other than 429, malformed responses) will not get
+        // better on retry — surface them immediately.
+        if (!error.retryable || attempt === this.maxRetries) throw error;
+        const backoffMs = Math.min(8000, 500 * 2 ** attempt);
+        console.warn(
+          `Gemini request failed (attempt ${attempt + 1}/${this.maxRetries + 1}): ${error.message}. Retrying in ${backoffMs}ms.`
+        );
+        await delay(backoffMs);
+      }
+    }
+    throw lastError;
+  }
+
+  async attemptJsonResponse({ schema, prompt }) {
     const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
@@ -161,8 +195,12 @@ export class GeminiProvider {
       });
     } catch (error) {
       if (error.name === "AbortError") {
-        throw new Error(`Gemini request timed out after ${this.requestTimeoutMs}ms.`);
+        const timeoutError = new Error(`Gemini request timed out after ${this.requestTimeoutMs}ms.`);
+        timeoutError.retryable = true;
+        throw timeoutError;
       }
+      // Network-level failures (fetch failed, ECONNRESET) are transient by nature.
+      error.retryable = true;
       throw error;
     } finally {
       clearTimeout(timeout);
@@ -170,7 +208,9 @@ export class GeminiProvider {
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`Gemini request failed with ${response.status}: ${body}`);
+      const requestError = new Error(`Gemini request failed with ${response.status}: ${body}`);
+      requestError.retryable = response.status === 429 || response.status >= 500;
+      throw requestError;
     }
 
     const data = await response.json();
@@ -180,6 +220,32 @@ export class GeminiProvider {
     }
     return JSON.parse(outputText);
   }
+}
+
+// Degraded reconstruction for a chunk that could not be role-repaired: keep each
+// normalized segment as its own turn under its raw speaker label so the text survives.
+function passthroughReconstruction(segments, error) {
+  const speakers = [...new Set(segments.map((segment) => String(segment.speaker || "").trim()).filter(Boolean))];
+  const roles = speakers.length
+    ? speakers.map((label, index) => ({ id: `role_${index + 1}`, label, description: "" }))
+    : undefined;
+  return repairReconstructedTranscript({
+    roles,
+    turns: segments.map((segment) => ({
+      role: String(segment.speaker || "").trim() || "Speaker",
+      start: segment.start,
+      end: segment.end,
+      text: segment.english || segment.text || "",
+      sourceSegmentIds: segment.id ? [segment.id] : [],
+      confidence: "low",
+      flags: ["reconstruction_skipped"]
+    })),
+    warnings: [`Speaker reconstruction was skipped for ${segments.length} segment(s): ${error.message}`]
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function mergeRoles(existingRoles, newRoles) {

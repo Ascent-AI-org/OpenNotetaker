@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { readConfig } from "../src/config.js";
 import { GeminiProvider } from "../src/providers/gemini.js";
 import { MockLlmProvider } from "../src/providers/mock.js";
+import { processRawSegments } from "../src/domain/pipeline.js";
 import { repairActionItems, repairReconstructedTranscript } from "../src/providers/openai.js";
 import { DeepgramStreamingClient, deepgramResultToSegments } from "../src/providers/deepgram.js";
 import { JsonStore } from "../src/storage/json-store.js";
@@ -816,6 +817,228 @@ test("Gemini provider reconstructs speaker roles in chunks", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("Gemini provider retries a transient timeout and then succeeds", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      const abort = new Error("The operation was aborted.");
+      abort.name = "AbortError";
+      throw abort;
+    }
+    return {
+      ok: true,
+      async json() {
+        return {
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      segments: [
+                        {
+                          id: "seg-a",
+                          speaker: "Speaker 1",
+                          start: 1,
+                          end: 2,
+                          raw: "x",
+                          english: "Recovered after a retry.",
+                          confidence: "high",
+                          uncertainTerms: []
+                        }
+                      ]
+                    })
+                  }
+                ]
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+
+  try {
+    const provider = new GeminiProvider({ apiKey: "test-key", model: "gemini-test", maxRetries: 2 });
+    const result = await provider.normalizeSegments([
+      { id: "seg-a", speaker: "Speaker 1", start: 1, end: 2, text: "x" }
+    ]);
+    assert.equal(calls, 2, "the first call times out and the second succeeds");
+    assert.equal(result[0].english, "Recovered after a retry.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Gemini provider does not retry a non-retryable 4xx", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 400,
+      async text() {
+        return "invalid argument";
+      }
+    };
+  };
+
+  try {
+    const provider = new GeminiProvider({ apiKey: "test-key", model: "gemini-test", maxRetries: 3 });
+    await assert.rejects(
+      provider.normalizeSegments([{ id: "seg-a", speaker: "Speaker 1", start: 1, end: 2, text: "x" }]),
+      /Gemini request failed with 400/
+    );
+    assert.equal(calls, 1, "a 400 is fatal — no retries");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Gemini reconstruct degrades a failed chunk to passthrough instead of failing", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const prompt = body.contents[0].parts[0].text;
+    const payload = JSON.parse(prompt.slice(prompt.indexOf("{")));
+    // The chunk containing seg-1 always times out; every other chunk succeeds.
+    if (payload.segments.some((segment) => segment.id === "seg-1")) {
+      const abort = new Error("The operation was aborted.");
+      abort.name = "AbortError";
+      throw abort;
+    }
+    return {
+      ok: true,
+      async json() {
+        return {
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      roles: [{ id: "r1", label: "Role One", description: "" }],
+                      turns: payload.segments.map((segment) => ({
+                        id: `t-${segment.id}`,
+                        role: "Role One",
+                        start: segment.start,
+                        end: segment.end,
+                        text: `Clean ${segment.id}`,
+                        sourceSegmentIds: [segment.id],
+                        confidence: "high",
+                        flags: []
+                      })),
+                      warnings: []
+                    })
+                  }
+                ]
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+
+  try {
+    // reconstructChunkSize floors at 8, so 16 segments make exactly two chunks: the
+    // first (seg-1..seg-8) always times out, the second (seg-9..seg-16) succeeds.
+    const provider = new GeminiProvider({
+      apiKey: "test-key",
+      model: "gemini-test",
+      reconstructChunkSize: 8,
+      maxRetries: 0
+    });
+    const segments = Array.from({ length: 16 }, (_, index) => ({
+      id: `seg-${index + 1}`,
+      speaker: `Speaker ${(index % 2) + 1}`,
+      start: index + 1,
+      end: index + 2,
+      english: `english ${index + 1}`
+    }));
+
+    const result = await provider.reconstructTranscript(segments);
+
+    // All sixteen segments survive as turns even though the first chunk's LLM call failed.
+    assert.equal(result.turns.length, 16);
+    const texts = result.turns.map((turn) => turn.text);
+    assert.ok(texts.includes("english 1"), "the failed chunk falls back to the normalized text");
+    assert.ok(texts.includes("Clean seg-9"), "the healthy chunk keeps its repaired text");
+    assert.ok(result.warnings.some((warning) => /reconstruction was skipped/i.test(warning)));
+    assert.ok(result.turns.some((turn) => turn.flags.includes("reconstruction_skipped")));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("pipeline still produces notes when speaker reconstruction throws", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "open-notetaker-pipeline-"));
+  const storePath = join(dir, "data", "meetings.json");
+  const store = new JsonStore(storePath);
+  await store.load();
+  const meeting = await store.createMeeting({
+    title: "Reconstruct failure",
+    meetUrl: "https://meet.google.com/abc-defg-hij",
+    scheduledAt: new Date().toISOString(),
+    consentMode: "host_confirmed",
+    retentionDays: 30
+  });
+
+  // A provider whose reconstruction pass fails hard (e.g. an unrecoverable LLM error):
+  // the meeting must still complete from the normalized transcript rather than fail.
+  const failingReconstructProvider = {
+    async normalizeSegments(rawSegments) {
+      return rawSegments.map((segment) => ({
+        id: segment.id,
+        speaker: segment.speaker,
+        start: segment.start,
+        end: segment.end,
+        raw: segment.text,
+        english: `English ${segment.id}`,
+        confidence: "high",
+        uncertainTerms: []
+      }));
+    },
+    async reconstructTranscript() {
+      throw new Error("reconstruction unavailable");
+    },
+    async extractNotes() {
+      return {
+        summary: "A short meeting.",
+        detailedNotes: ["Something was discussed."],
+        decisions: [],
+        actionItems: [{ task: "Follow up", owner: "Unknown", due: "Not stated", evidenceSegmentIds: [] }],
+        openQuestions: [],
+        risks: []
+      };
+    },
+    async verifyActionItems({ notes }) {
+      return { actionItems: notes.actionItems, warnings: [] };
+    }
+  };
+
+  const completed = await processRawSegments({
+    meeting,
+    store,
+    llmProvider: failingReconstructProvider,
+    rawSegments: [
+      { id: "seg-1", speaker: "Speaker 1", start: 0, end: 2, text: "haan kal tak" },
+      { id: "seg-2", speaker: "Speaker 2", start: 2, end: 4, text: "theek hai" }
+    ]
+  });
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.artifacts.notes.actionItems.length, 1);
+  // Re-read the meeting: processRawSegments returns the snapshot taken just before the
+  // final notes.ready event is appended.
+  const events = store.getMeeting(meeting.id).events.map((event) => event.type);
+  assert.ok(events.includes("transcript.reconstruct_failed"), "the degradation is recorded as an event");
+  assert.ok(events.includes("notes.ready"));
 });
 
 test("repairs reconstructed transcript role ids and unsafe values", () => {

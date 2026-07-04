@@ -35,7 +35,7 @@ export async function finalizeRawTranscript({ meeting, store, config, rawSegment
   return processRawSegments({ meeting, store, llmProvider, rawSegments, stepDelayMs: 0 });
 }
 
-async function processRawSegments({ meeting, store, llmProvider, rawSegments, stepDelayMs }) {
+export async function processRawSegments({ meeting, store, llmProvider, rawSegments, stepDelayMs = 0 }) {
   if (!Array.isArray(rawSegments) || rawSegments.length === 0) {
     await store.updateMeeting(meeting.id, {
       status: "failed",
@@ -92,13 +92,30 @@ async function processRawSegments({ meeting, store, llmProvider, rawSegments, st
   });
 
   await delay(stepDelayMs);
-  const reconstructedTranscript = await reconstructTranscript({
-    meeting,
-    store,
-    llmProvider,
-    normalizedSegments,
-    participants
-  });
+  // Speaker/role reconstruction is an enhancement: it relabels "Speaker 1/2/3" into
+  // stable roles. If it fails (e.g. a transient LLM timeout on one chunk of a long
+  // meeting), degrade to the normalized transcript rather than discarding hours of
+  // already-captured audio — notes are extracted from normalizedSegments below. This
+  // mirrors the fail-soft handling of verifyActionItems.
+  let reconstructedTranscript = null;
+  try {
+    reconstructedTranscript = await reconstructTranscript({
+      meeting,
+      store,
+      llmProvider,
+      normalizedSegments,
+      participants
+    });
+  } catch (error) {
+    await store.updateMeeting(meeting.id, {
+      status: "reconstructing",
+      statusMessage: "Speaker reconstruction was skipped; continuing with the normalized transcript."
+    });
+    await store.appendEvent(meeting.id, {
+      type: "transcript.reconstruct_failed",
+      message: `Speaker reconstruction failed; continuing with the normalized transcript. ${error.message}`
+    });
+  }
   const notesSource = reconstructedTranscript || { segments: normalizedSegments };
   const notes = await llmProvider.extractNotes(notesSource, { participants });
   await verifyActionItems({ meeting, store, llmProvider, notesSource, notes, participants });

@@ -595,6 +595,18 @@ async function route(request, response) {
       });
     }
 
+    // A meeting that failed *after* capturing a transcript (a finalization/notes error)
+    // is recovered by re-running finalization on the stored segments. Re-recording would
+    // only send a bot to an already-ended call and throw away the captured audio.
+    const capturedSegments = meeting.artifacts?.rawSegments || [];
+    if (meeting.status === "failed" && capturedSegments.length > 0) {
+      refinalizeMeeting(meeting, capturedSegments);
+      return sendJson(response, 202, {
+        meeting: store.getMeeting(meeting.id),
+        message: "Re-running notes from the captured transcript."
+      });
+    }
+
     startMeetingJob(meeting);
 
     return sendJson(response, 202, {
@@ -796,6 +808,35 @@ function startMeetingJob(meeting) {
       });
       await store.appendEvent(meeting.id, {
         type: "job.failed",
+        message: error.message
+      });
+      await propagateFailureToFollowers(meeting.id).catch(() => {});
+    })
+    .finally(() => runningJobs.delete(meeting.id));
+}
+
+// Re-run notes generation from an already-captured transcript (used when a meeting
+// failed at finalization). The runningJobs guard prevents a double-click from starting
+// two finalizations of the same segments.
+function refinalizeMeeting(meeting, rawSegments) {
+  runningJobs.add(meeting.id);
+  finalizeRawTranscript({ meeting, store, config, rawSegments })
+    .then(async (completed) => {
+      try {
+        await emailMeetingTranscript(completed, { manual: false });
+      } catch (error) {
+        console.error(error);
+      }
+      await propagateToFollowers(completed).catch((error) => console.error(error));
+    })
+    .catch(async (error) => {
+      console.error(error);
+      await store.updateMeeting(meeting.id, {
+        status: "failed",
+        statusMessage: "Transcript finalization failed. Check server logs."
+      });
+      await store.appendEvent(meeting.id, {
+        type: "notes.failed",
         message: error.message
       });
       await propagateFailureToFollowers(meeting.id).catch(() => {});
