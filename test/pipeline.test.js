@@ -159,6 +159,77 @@ test("recovers from a corrupted store file and survives a failed write", async (
   assert.equal(updated.statusMessage, "write works again");
 });
 
+test("pruneExpiredArtifacts clears transcripts past retention but keeps notes, active jobs, and is idempotent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "open-notetaker-retention-"));
+  const store = new JsonStore(join(dir, "data", "meetings.json"));
+  await store.load();
+  const isActiveStatus = (status) => ["queued", "recording"].includes(status);
+
+  const now = Date.parse("2026-07-19T00:00:00.000Z");
+  const daysAgo = (days) => new Date(now - days * 24 * 60 * 60 * 1000).toISOString();
+  const someSegments = [{ id: "s1", start: 0, text: "hi" }];
+
+  const expired = await store.createMeeting({
+    title: "Past retention",
+    meetUrl: "https://meet.google.com/aaa-bbbb-ccc",
+    scheduledAt: daysAgo(31),
+    consentMode: "host_confirmed",
+    retentionDays: 30
+  });
+  await store.updateMeeting(expired.id, {
+    createdAt: daysAgo(31),
+    status: "completed",
+    artifacts: { rawSegments: someSegments, normalizedSegments: someSegments, notes: "Keep this summary." }
+  });
+
+  const withinWindow = await store.createMeeting({
+    title: "Within retention",
+    meetUrl: "https://meet.google.com/ddd-eeee-fff",
+    scheduledAt: daysAgo(5),
+    consentMode: "host_confirmed",
+    retentionDays: 30
+  });
+  await store.updateMeeting(withinWindow.id, {
+    createdAt: daysAgo(5),
+    status: "completed",
+    artifacts: { rawSegments: someSegments, normalizedSegments: someSegments, notes: "Recent." }
+  });
+
+  const stillRecording = await store.createMeeting({
+    title: "Expired but still running",
+    meetUrl: "https://meet.google.com/ggg-hhhh-iii",
+    scheduledAt: daysAgo(60),
+    consentMode: "host_confirmed",
+    retentionDays: 30
+  });
+  await store.updateMeeting(stillRecording.id, {
+    createdAt: daysAgo(60),
+    status: "recording",
+    artifacts: { rawSegments: someSegments, normalizedSegments: someSegments, notes: null }
+  });
+
+  const prunedCount = await store.pruneExpiredArtifacts(now, { isActiveStatus });
+  assert.equal(prunedCount, 1);
+
+  const expiredAfter = store.getMeeting(expired.id);
+  assert.deepEqual(expiredAfter.artifacts.rawSegments, []);
+  assert.deepEqual(expiredAfter.artifacts.normalizedSegments, []);
+  assert.equal(expiredAfter.artifacts.notes, "Keep this summary.");
+  assert.ok(expiredAfter.artifactsPurgedAt);
+  assert.equal(expiredAfter.events.at(-1).type, "retention.artifacts_purged");
+
+  const withinWindowAfter = store.getMeeting(withinWindow.id);
+  assert.deepEqual(withinWindowAfter.artifacts.rawSegments, someSegments);
+
+  const stillRecordingAfter = store.getMeeting(stillRecording.id);
+  assert.deepEqual(stillRecordingAfter.artifacts.rawSegments, someSegments, "active jobs must never be pruned");
+
+  // Second sweep must be a no-op: already-purged meetings are skipped and nothing
+  // new qualifies, so it must not trigger another full-store persist().
+  const secondSweep = await store.pruneExpiredArtifacts(now + 1000, { isActiveStatus });
+  assert.equal(secondSweep, 0);
+});
+
 test("hashes and verifies passwords with scrypt, failing closed on tampering", async () => {
   const hash = await hashPassword("kal tak bhej dena 123");
   assert.match(hash, /^scrypt\$16384\$8\$1\$/);
