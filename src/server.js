@@ -565,7 +565,14 @@ async function route(request, response) {
     const user = await requireUser(request, response);
     if (!user) return;
     return sendJson(response, 200, {
-      meetings: store.listMeetings().filter((meeting) => meeting.ownerId === user.id)
+      // Summaries only: the full transcript (rawSegments/normalizedSegments) is
+      // what balloons this response once a meeting history builds up, and only
+      // one meeting's transcript is ever shown at a time. The client fetches the
+      // full meeting (GET /api/meetings/:id) when a card is opened.
+      meetings: store
+        .listMeetings()
+        .filter((meeting) => meeting.ownerId === user.id)
+        .map(summarizeMeeting)
     });
   }
 
@@ -1519,6 +1526,23 @@ function isRunnerAuthorized(request) {
 
 function isActiveJobStatus(status) {
   return ["queued", "recording", "transcribing", "normalizing", "reconstructing", "following"].includes(status);
+}
+
+// List-view payload for GET /api/meetings: keeps everything the sidebar and
+// action-item counts need, drops the transcript arrays that dominate response
+// size. The client (hasFullArtifacts in app.js) treats their absence as "fetch
+// GET /api/meetings/:id for the full transcript" and fills it in on selection.
+function summarizeMeeting(meeting) {
+  const { artifacts, ...rest } = meeting;
+  return {
+    ...rest,
+    artifacts: {
+      notes: artifacts?.notes ?? null,
+      reconstructedTranscript: null,
+      rawSegmentCount: artifacts?.rawSegments?.length ?? 0,
+      normalizedSegmentCount: artifacts?.normalizedSegments?.length ?? 0
+    }
+  };
 }
 
 // When a recording completes, every meeting following it (other users on the same

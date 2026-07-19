@@ -193,6 +193,11 @@ function selectMeeting(id) {
   updateViewNav();
   renderList();
   renderMain();
+  // The list only carries a summary; fetch the full transcript for whatever
+  // just got selected and re-render once it lands.
+  void ensureMeetingDetail(id).then((changed) => {
+    if (changed && state.selectedId === id) renderMain();
+  });
 }
 
 function showCalendarView() {
@@ -480,14 +485,25 @@ async function refresh() {
   if (!state.user) return;
   try {
     const { meetings } = await api("/api/meetings");
-    state.meetings = meetings;
+    // The list only carries summaries (see summarizeMeeting on the server). Keep
+    // whatever full transcript we've already fetched for a meeting as long as it
+    // hasn't changed server-side, instead of downgrading it back to a summary on
+    // every poll tick.
+    const cachedById = new Map(
+      (state.meetings || []).filter(hasFullArtifacts).map((meeting) => [meeting.id, meeting])
+    );
+    state.meetings = meetings.map((meeting) => {
+      const cached = cachedById.get(meeting.id);
+      return cached && cached.updatedAt === meeting.updatedAt ? cached : meeting;
+    });
     setAppError("");
-    if (!state.selectedId && meetings.length) state.selectedId = meetings[0].id;
-    if (state.selectedId && !meetings.some((meeting) => meeting.id === state.selectedId)) {
-      state.selectedId = meetings[0]?.id || null;
+    if (!state.selectedId && state.meetings.length) state.selectedId = state.meetings[0].id;
+    if (state.selectedId && !state.meetings.some((meeting) => meeting.id === state.selectedId)) {
+      state.selectedId = state.meetings[0]?.id || null;
     }
     renderList();
     renderMain();
+    if (await ensureMeetingDetail(state.selectedId)) renderMain();
   } catch (error) {
     if (error.status === 401) {
       showAuthGate();
@@ -496,6 +512,30 @@ async function refresh() {
     setAppError(error.message);
   }
   await Promise.all([refreshGmail(), refreshCalendar()]);
+}
+
+function hasFullArtifacts(meeting) {
+  return Array.isArray(meeting?.artifacts?.rawSegments);
+}
+
+// Fetches the full meeting (transcript included) when the list-view summary
+// isn't enough. Returns whether state.meetings actually changed, so callers
+// know whether a re-render is worth it.
+async function ensureMeetingDetail(id) {
+  if (!id) return false;
+  const current = (state.meetings || []).find((meeting) => meeting.id === id);
+  if (!current || hasFullArtifacts(current)) return false;
+  try {
+    const { meeting } = await api(`/api/meetings/${id}`);
+    const index = state.meetings.findIndex((item) => item.id === id);
+    if (index === -1) return false;
+    state.meetings[index] = meeting;
+    return true;
+  } catch (error) {
+    if (error.status === 401) showAuthGate();
+    else setAppError(error.message);
+    return false;
+  }
 }
 
 function setAppError(message) {
@@ -797,6 +837,15 @@ function renderNotes(notes) {
 }
 
 function renderTranscript(meeting) {
+  // The list endpoint only sends a summary; a meeting past "scheduled" has (or
+  // is expected to grow) a transcript, so show a loading fold instead of
+  // silently rendering nothing until ensureMeetingDetail's fetch lands.
+  if (!hasFullArtifacts(meeting)) {
+    return meeting.status === "scheduled"
+      ? ""
+      : renderFold("transcript", "Transcript", "…", `<p>Loading transcript…</p>`);
+  }
+
   const reconstructed = meeting.artifacts?.reconstructedTranscript;
   const turns = reconstructed?.turns || [];
   const rawSegments = meeting.artifacts?.rawSegments || [];
