@@ -88,6 +88,18 @@ const sessionSweeper = setInterval(() => {
 }, 60 * 60 * 1000);
 sessionSweeper.unref?.();
 
+// The store keeps every meeting in memory and rewrites the whole file on every
+// mutation, so raw transcripts left in place forever eventually OOM the process.
+// Run once at boot (in case retention lapsed while the server was down) and then
+// hourly, mirroring sessionSweeper above.
+await store.pruneExpiredArtifacts(Date.now(), { isActiveStatus: isActiveJobStatus }).catch((error) => {
+  console.error(error);
+});
+const retentionSweeper = setInterval(() => {
+  store.pruneExpiredArtifacts(Date.now(), { isActiveStatus: isActiveJobStatus }).catch((error) => console.error(error));
+}, 60 * 60 * 1000);
+retentionSweeper.unref?.();
+
 const runningJobs = new Set();
 // OAuth state -> { userId, expiresAt }: binds each Google callback to the signed-in
 // user who started it, with a 10-minute validity window.

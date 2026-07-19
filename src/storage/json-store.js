@@ -115,6 +115,43 @@ export class JsonStore {
     });
   }
 
+  // Clears the raw/normalized transcript once a meeting is past its configured
+  // retentionDays, so the store (loaded fully into memory and rewritten in full on
+  // every persist()) doesn't grow without bound. The meeting record and its
+  // generated notes survive; only the bulky verbatim transcript is purged. Never
+  // touches meetings still mid-recording (isActiveStatus) or already purged, and
+  // batches every change into a single persist() instead of one per meeting.
+  async pruneExpiredArtifacts(now, { isActiveStatus }) {
+    let prunedCount = 0;
+    for (const meeting of this.state.meetings) {
+      if (meeting.artifactsPurgedAt) continue;
+      if (isActiveStatus(meeting.status)) continue;
+
+      const rawCount = meeting.artifacts?.rawSegments?.length || 0;
+      const normalizedCount = meeting.artifacts?.normalizedSegments?.length || 0;
+      if (rawCount === 0 && normalizedCount === 0) continue;
+
+      const retentionDays = Number.isInteger(meeting.retentionDays) ? meeting.retentionDays : 30;
+      const ageMs = now - new Date(meeting.createdAt).getTime();
+      if (!(ageMs >= retentionDays * 24 * 60 * 60 * 1000)) continue;
+
+      const purgedAt = new Date(now).toISOString();
+      meeting.artifacts.rawSegments = [];
+      meeting.artifacts.normalizedSegments = [];
+      meeting.artifactsPurgedAt = purgedAt;
+      meeting.updatedAt = purgedAt;
+      meeting.events.push({
+        at: purgedAt,
+        type: "retention.artifacts_purged",
+        message: `Raw transcript purged after the ${retentionDays}-day retention window (${rawCount} raw / ${normalizedCount} normalized segments removed).`
+      });
+      prunedCount += 1;
+    }
+
+    if (prunedCount > 0) await this.persist();
+    return prunedCount;
+  }
+
   async persist() {
     // Recover the chain from a previous failed write before appending the next one:
     // chaining .then() onto a rejected promise would silently skip every future write,
