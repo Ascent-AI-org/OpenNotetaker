@@ -182,7 +182,9 @@ export async function getGoogleAccessToken({ auth, tokenPath }) {
   }
 
   if (!token.refresh_token) {
-    throw new Error("Google token expired. Reconnect Google Workspace to continue.");
+    const error = new Error("Google token expired. Reconnect Google Workspace to continue.");
+    error.code = "no_refresh_token";
+    throw error;
   }
 
   const refreshed = await requestToken({
@@ -215,7 +217,12 @@ async function requestToken(params) {
   });
   const body = await parseJsonResponse(response);
   if (!response.ok) {
-    throw new Error(body?.error_description || body?.error || "Google OAuth token request failed.");
+    // Google's OAuth error codes (invalid_grant, etc.) are stable and machine-checkable;
+    // error_description is just human-readable prose layered on top, so callers that need
+    // to distinguish "needs reconnect" from other failures should check .code, not the message.
+    const error = new Error(body?.error_description || body?.error || "Google OAuth token request failed.");
+    error.code = body?.error || null;
+    throw error;
   }
   return body;
 }

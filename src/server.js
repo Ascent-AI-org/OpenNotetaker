@@ -978,13 +978,25 @@ async function getGmailStatus(user) {
   };
 }
 
+// Error codes from a calendar sync attempt that only a fresh OAuth grant can fix — as
+// opposed to a transient network/API error, which shouldn't tell the user to reconnect.
+const CALENDAR_NEEDS_RECONNECT_CODES = new Set(["invalid_grant", "no_refresh_token", "calendar_scope_missing"]);
+
 async function getCalendarStatus(user) {
   const configured = isGmailConfigured();
   const tokenStatus = configured ? await getGoogleTokenStatus(userGoogleTokenPath(user.id)) : null;
+  // tokenStatus only reflects the scope recorded at grant time, not whether the refresh
+  // token Google holds is still alive — that's only knowable once a real API call fails.
+  // The scheduler makes that call every pollSeconds regardless of whether anyone has the
+  // dashboard open, so its last result is what actually answers "is this still connected."
+  const myLastError = calendarRuntime.lastResult?.userErrors?.find((entry) => entry.userId === user.id) || null;
+  const needsReconnect = CALENDAR_NEEDS_RECONNECT_CODES.has(myLastError?.code);
   return {
     configured,
-    connected: Boolean(tokenStatus?.calendarReadonly),
+    connected: Boolean(tokenStatus?.calendarReadonly) && !needsReconnect,
     googleConnected: Boolean(tokenStatus?.connected),
+    needsReconnect,
+    lastSyncError: myLastError?.message || null,
     enabled: Boolean(user.settings?.calendarSyncEnabled) && config.google.calendar.enabled,
     schedulerEnabled: config.google.calendar.enabled,
     autoStart: Boolean(user.settings?.calendarAutoStart) && config.google.calendar.autoStart,
@@ -1192,7 +1204,11 @@ async function runCalendarSync(reason, { onlyUserId = null } = {}) {
         if (onlyUserId) {
           throw new Error("Reconnect Google to grant Calendar read-only access.");
         }
-        userErrors.push({ userId: user.id, message: "calendar_scope_missing" });
+        userErrors.push({
+          userId: user.id,
+          code: "calendar_scope_missing",
+          message: "Reconnect Google to grant Calendar read-only access."
+        });
         continue;
       }
 
@@ -1213,7 +1229,7 @@ async function runCalendarSync(reason, { onlyUserId = null } = {}) {
         }
       } catch (error) {
         if (onlyUserId) throw error;
-        userErrors.push({ userId: user.id, message: error.message });
+        userErrors.push({ userId: user.id, code: error.code || null, message: error.message });
       }
     }
 

@@ -1317,6 +1317,11 @@ function renderGoogleChip() {
     googleStatusLabel.textContent = "Google not configured";
     return;
   }
+  if (calendar?.needsReconnect) {
+    googleDot.className = "dot dot-bad";
+    googleStatusLabel.textContent = "Google access expired";
+    return;
+  }
   if (gmail.connected || calendar?.connected) {
     googleDot.className = "dot dot-ok";
     googleStatusLabel.textContent = "Google connected";
@@ -1356,6 +1361,8 @@ function renderSettingsStatuses({ keepCalendarMeta = false } = {}) {
       calendarStatusText.textContent = calendar.error;
     } else if (!calendar.configured) {
       calendarStatusText.textContent = "Calendar needs the same Google OAuth credentials.";
+    } else if (calendar.needsReconnect) {
+      calendarStatusText.textContent = `Google access expired — reconnect to resume calendar sync.${calendar.lastSyncError ? ` (${calendar.lastSyncError})` : ""}`;
     } else if (!calendar.connected) {
       calendarStatusText.textContent = calendar.googleConnected
         ? "Reconnect Google to grant Calendar read access."
