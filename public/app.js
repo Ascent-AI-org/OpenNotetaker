@@ -11,10 +11,41 @@ const state = {
   runningStarts: new Set(),
   sendingEmails: new Set(),
   syncingCalendar: false,
-  openFolds: new Set(["transcript"])
+  openFolds: new Set(["transcript"]),
+  export: null // initialised below, once EXPORT_SECTIONS exists
 };
 
 const renderCache = { list: "", detail: "" };
+
+// Keys must match EXPORT_SECTIONS in src/domain/export.js — the server validates against
+// its own list and answers 400 for anything it does not recognise.
+const EXPORT_SECTIONS = [
+  { key: "summary", label: "Summary" },
+  { key: "detailedNotes", label: "Detailed notes" },
+  { key: "actionItems", label: "Action items" },
+  { key: "decisions", label: "Decisions" },
+  { key: "openQuestions", label: "Open questions" },
+  { key: "risks", label: "Risks" },
+  { key: "participants", label: "Participants" },
+  { key: "roleTranscript", label: "Role-corrected transcript" },
+  { key: "cleanTranscript", label: "Clean English transcript" },
+  { key: "rawTranscript", label: "Raw Hinglish transcript" },
+  { key: "runLog", label: "Run log" }
+];
+
+const DEFAULT_EXPORT_SECTIONS = EXPORT_SECTIONS.map((section) => section.key).filter(
+  (key) => !["rawTranscript", "runLog"].includes(key)
+);
+
+state.export = {
+  open: false,
+  scope: "meeting", // "meeting" | "all" | "pick"
+  picked: new Set(),
+  sections: new Set(DEFAULT_EXPORT_SECTIONS),
+  format: "md",
+  busy: false,
+  error: ""
+};
 
 const STATUS_META = {
   scheduled: { label: "Scheduled", tone: "muted" },
@@ -156,6 +187,18 @@ inviteCopy.addEventListener("click", async () => {
   }
 });
 teamList.addEventListener("click", handleTeamAction);
+
+// Export popover: delegated, because the app bar it lives in is rebuilt on every render.
+detail.addEventListener("click", handleExportClick);
+detail.addEventListener("change", handleExportChange);
+document.addEventListener("click", (event) => {
+  if (!state.export.open) return;
+  if (event.target.closest("[data-export-root]")) return;
+  closeExportMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.export.open) closeExportMenu();
+});
 
 // Keyboard: C creates a meeting, J/K move through the list, V toggles the calendar,
 // arrows page weeks while the calendar is open (Linear-style).
@@ -638,6 +681,248 @@ function renderAppBar({ left, right = "" }) {
   `;
 }
 
+/* ---------- Export ---------- */
+
+const MAX_EXPORT_MEETINGS = 200;
+
+function renderExportControl() {
+  return `
+    <div class="export-menu" data-export-root>
+      <button class="btn btn-secondary btn-sm" type="button" data-export-toggle
+              aria-haspopup="dialog" aria-expanded="${state.export.open ? "true" : "false"}">Export</button>
+      ${state.export.open ? renderExportPanel() : ""}
+    </div>
+  `;
+}
+
+function renderExportPanel() {
+  const meetings = state.meetings || [];
+  const hasSelection = Boolean(state.selectedId);
+  const { scope, sections, format, picked } = state.export;
+
+  return `
+    <div class="export-panel" role="dialog" aria-label="Export meetings">
+      <section class="export-group">
+        <p class="export-label">Meetings</p>
+        ${renderExportRadio("export-scope", "meeting", "This meeting", scope === "meeting", !hasSelection)}
+        ${renderExportRadio("export-scope", "all", `All meetings (${meetings.length})`, scope === "all")}
+        ${renderExportRadio("export-scope", "pick", "Choose…", scope === "pick")}
+        <div class="export-picklist" data-export-picklist ${scope === "pick" ? "" : "hidden"}>
+          ${
+            meetings.length
+              ? meetings
+                  .map(
+                    (meeting) => `
+                      <label class="export-choice export-choice-pick">
+                        <input type="checkbox" data-pick="${escapeHtml(meeting.id)}" ${picked.has(meeting.id) ? "checked" : ""} />
+                        <span class="export-pick-title">${escapeHtml(meeting.title)}</span>
+                        <span class="export-pick-time">${escapeHtml(formatDayTime(meeting.scheduledAt))}</span>
+                      </label>
+                    `
+                  )
+                  .join("")
+              : `<p class="export-empty">No meetings yet.</p>`
+          }
+        </div>
+      </section>
+
+      <section class="export-group">
+        <p class="export-label">
+          Include
+          <span class="export-presets">
+            <button type="button" class="link-button" data-export-preset="all">All</button>
+            <button type="button" class="link-button" data-export-preset="none">None</button>
+          </span>
+        </p>
+        ${EXPORT_SECTIONS.map(
+          (section) => `
+            <label class="export-choice">
+              <input type="checkbox" data-section="${section.key}" ${sections.has(section.key) ? "checked" : ""} />
+              <span>${escapeHtml(section.label)}</span>
+            </label>
+          `
+        ).join("")}
+      </section>
+
+      <section class="export-group">
+        <p class="export-label">Format</p>
+        ${renderExportRadio("export-format", "md", "Markdown (.md)", format === "md")}
+        ${renderExportRadio("export-format", "json", "JSON (.json)", format === "json")}
+      </section>
+
+      <p class="export-error" data-export-error ${state.export.error ? "" : "hidden"}>${escapeHtml(state.export.error)}</p>
+      <footer class="export-foot">
+        <span class="export-hint" data-export-hint>${escapeHtml(exportSummaryText())}</span>
+        <button type="button" class="btn btn-primary btn-sm" data-export-run ${exportRunnable() ? "" : "disabled"}>
+          ${state.export.busy ? "Preparing…" : "Download"}
+        </button>
+      </footer>
+    </div>
+  `;
+}
+
+function renderExportRadio(name, value, label, checked, disabled = false) {
+  return `
+    <label class="export-choice${disabled ? " is-disabled" : ""}">
+      <input type="radio" name="${name}" value="${value}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} />
+      <span>${escapeHtml(label)}</span>
+    </label>
+  `;
+}
+
+function handleExportClick(event) {
+  if (event.target.closest("[data-export-toggle]")) {
+    toggleExportMenu();
+    return;
+  }
+  const preset = event.target.closest("[data-export-preset]");
+  if (preset) {
+    state.export.sections =
+      preset.dataset.exportPreset === "all"
+        ? new Set(EXPORT_SECTIONS.map((section) => section.key))
+        : new Set();
+    for (const box of detail.querySelectorAll("input[data-section]")) {
+      box.checked = state.export.sections.has(box.dataset.section);
+    }
+    refreshExportPanel();
+    return;
+  }
+  if (event.target.closest("[data-export-run]")) runExport();
+}
+
+function handleExportChange(event) {
+  const input = event.target;
+  if (input.name === "export-scope") state.export.scope = input.value;
+  else if (input.name === "export-format") state.export.format = input.value;
+  else if (input.dataset.section) toggleInSet(state.export.sections, input.dataset.section, input.checked);
+  else if (input.dataset.pick) toggleInSet(state.export.picked, input.dataset.pick, input.checked);
+  else return;
+  state.export.error = "";
+  // Patched in place rather than re-rendered: a full render would steal focus mid-selection.
+  refreshExportPanel();
+}
+
+function toggleInSet(set, value, present) {
+  if (present) set.add(value);
+  else set.delete(value);
+}
+
+function toggleExportMenu() {
+  state.export.open = !state.export.open;
+  state.export.error = "";
+  // "This meeting" is meaningless with nothing selected — fall back to the whole account.
+  if (state.export.open && !state.selectedId && state.export.scope === "meeting") {
+    state.export.scope = "all";
+  }
+  renderCache.detail = "";
+  renderDetail();
+}
+
+function closeExportMenu() {
+  if (!state.export.open) return;
+  state.export.open = false;
+  renderCache.detail = "";
+  renderDetail();
+}
+
+function refreshExportPanel() {
+  const root = detail.querySelector("[data-export-root]");
+  if (!root) return;
+  const picklist = root.querySelector("[data-export-picklist]");
+  if (picklist) picklist.hidden = state.export.scope !== "pick";
+  const hint = root.querySelector("[data-export-hint]");
+  if (hint) hint.textContent = exportSummaryText();
+  const error = root.querySelector("[data-export-error]");
+  if (error) {
+    error.textContent = state.export.error;
+    error.hidden = !state.export.error;
+  }
+  const run = root.querySelector("[data-export-run]");
+  if (run) {
+    run.disabled = !exportRunnable();
+    run.textContent = state.export.busy ? "Preparing…" : "Download";
+  }
+}
+
+function exportMeetingCount() {
+  if (state.export.scope === "all") return (state.meetings || []).length;
+  if (state.export.scope === "pick") return state.export.picked.size;
+  return state.selectedId ? 1 : 0;
+}
+
+function exportRunnable() {
+  const count = exportMeetingCount();
+  return !state.export.busy && count > 0 && count <= MAX_EXPORT_MEETINGS && state.export.sections.size > 0;
+}
+
+function exportSummaryText() {
+  const count = exportMeetingCount();
+  if (!count) return "Nothing selected";
+  if (count > MAX_EXPORT_MEETINGS) return `Too many — pick ${MAX_EXPORT_MEETINGS} or fewer`;
+  if (!state.export.sections.size) return "Pick at least one section";
+  const meetings = `${count} meeting${count === 1 ? "" : "s"}`;
+  const sections = `${state.export.sections.size} section${state.export.sections.size === 1 ? "" : "s"}`;
+  return count === 1 ? `${meetings} · ${sections}` : `${meetings} · ${sections} · .zip`;
+}
+
+async function runExport() {
+  if (!exportRunnable()) return;
+  state.export.busy = true;
+  state.export.error = "";
+  refreshExportPanel();
+
+  try {
+    const response = await fetch("/api/meetings/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        meetingIds: exportScopeIds(),
+        sections: [...state.export.sections],
+        format: state.export.format
+      })
+    });
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      const fieldError = body.fields ? Object.values(body.fields)[0] : "";
+      throw new Error(fieldError || body.message || "Export failed.");
+    }
+
+    const blob = await response.blob();
+    downloadBlob(blob, filenameFromResponse(response));
+    closeExportMenu();
+  } catch (error) {
+    state.export.error = error.message;
+  } finally {
+    state.export.busy = false;
+    refreshExportPanel();
+  }
+}
+
+function exportScopeIds() {
+  if (state.export.scope === "all") return "all";
+  if (state.export.scope === "pick") return [...state.export.picked];
+  return [state.selectedId];
+}
+
+function filenameFromResponse(response) {
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="([^"]+)"/u);
+  return match ? match[1] : `opennotetaker-export.${state.export.format}`;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  // Safari needs the object URL alive until the download has actually started.
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 /* ---------- Detail ---------- */
 
 function renderDetail() {
@@ -656,7 +941,7 @@ function renderDetail() {
 
   if (!meeting) {
     detail.innerHTML = `
-      ${renderAppBar({ left: `<span class="app-bar-crumb">Meetings</span>` })}
+      ${renderAppBar({ left: `<span class="app-bar-crumb">Meetings</span>`, right: renderExportControl() })}
       <div class="detail-body">
         <div class="empty-state">
           <h3>Nothing selected</h3>
@@ -678,7 +963,8 @@ function renderDetail() {
 
   detail.innerHTML = `
     ${renderAppBar({
-      left: `<span class="app-bar-crumb">Meetings</span><span class="app-bar-crumb-sep">›</span><span class="app-bar-doc-title">${escapeHtml(meeting.title)}</span>`
+      left: `<span class="app-bar-crumb">Meetings</span><span class="app-bar-crumb-sep">›</span><span class="app-bar-doc-title">${escapeHtml(meeting.title)}</span>`,
+      right: renderExportControl()
     })}
     <div class="detail-body">
       <header class="detail-head">

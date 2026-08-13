@@ -30,6 +30,12 @@ import {
   shouldSalvageRecording
 } from "./domain/runner-jobs.js";
 import { isGoogleMeetUrl, sanitizeRawSegments, validateMeetingInput } from "./domain/validation.js";
+import {
+  MAX_EXPORT_MEETINGS,
+  buildExportBundle,
+  parseExportRequest,
+  selectExportMeetings
+} from "./domain/export.js";
 import { buildTranscriptEmail } from "./domain/transcript-email.js";
 import {
   CALENDAR_READONLY_SCOPE,
@@ -79,6 +85,9 @@ const loginIpLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, 
 const loginAccountLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, max: 8 });
 const signupIpLimiter = new SlidingWindowRateLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
 const passwordResetLimiter = new SlidingWindowRateLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
+// An "all meetings" export serializes every stored artifact for one account into memory,
+// so it is capped per account rather than left as a free amplification lever.
+const exportLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -590,6 +599,50 @@ async function route(request, response) {
 
     const meeting = await store.createMeeting({ ...validation.value, ownerId: user.id });
     return sendJson(response, 201, { meeting });
+  }
+
+  // POST rather than a GET download link: the selection payload is unbounded, and every
+  // non-GET request already passes the same-origin check above, so this adds no CSRF surface.
+  if (url.pathname === "/api/meetings/export" && request.method === "POST") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    if (!exportLimiter.consume(`export:${user.id}`).allowed) {
+      return sendJson(response, 429, {
+        error: "rate_limited",
+        message: "Too many exports in a short window. Try again in a few minutes."
+      });
+    }
+
+    const body = await readJsonBody(request);
+    const parsed = parseExportRequest(body);
+    if (!parsed.ok) {
+      return sendJson(response, 400, { error: "validation_error", fields: parsed.errors });
+    }
+
+    // Ownership is applied inside selectExportMeetings before the requested ids are honoured,
+    // so another tenant's id yields nothing instead of confirming that meeting exists.
+    const meetings = selectExportMeetings(store.listMeetings(), user.id, parsed.value.meetingIds);
+    if (!meetings.length) {
+      return sendJson(response, 404, {
+        error: "no_meetings",
+        message: "No meetings matched this export."
+      });
+    }
+    // The id-list cap lives in parseExportRequest; "all" has to be capped here too, or a
+    // long-lived account turns one request into an unbounded in-memory serialization.
+    if (meetings.length > MAX_EXPORT_MEETINGS) {
+      return sendJson(response, 413, {
+        error: "export_too_large",
+        message: `Export at most ${MAX_EXPORT_MEETINGS} meetings at a time.`
+      });
+    }
+
+    const bundle = buildExportBundle({
+      meetings,
+      sections: parsed.value.sections,
+      format: parsed.value.format
+    });
+    return sendDownload(response, bundle);
   }
 
   const meetingMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)$/);
@@ -1603,6 +1656,20 @@ function sendJson(response, statusCode, payload) {
     "X-Content-Type-Options": "nosniff"
   });
   response.end(JSON.stringify(payload));
+}
+
+function sendDownload(response, { filename, contentType, body }) {
+  // exportFileName() already slugs to [a-z0-9-.], but strip quotes and newlines anyway so a
+  // future caller cannot inject a header through a filename.
+  const safeName = String(filename).replace(/["\r\n\\]/gu, "");
+  response.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": body.length,
+    "Content-Disposition": `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
+  });
+  response.end(body);
 }
 
 function sendHtml(response, statusCode, message) {

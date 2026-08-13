@@ -149,6 +149,20 @@ scoped to the signed-in account.
   *follows* the first and receives its own copy of the notes when the recording
   finishes.
 
+## Exporting
+
+The **Export** button in the top bar downloads meetings as Markdown or JSON — your
+notes are yours, and nothing here is a lock-in.
+
+- Pick **this meeting**, **all meetings**, or check off exactly the ones you want.
+- Pick what goes in: summary, detailed notes, action items, decisions, open
+  questions, risks, participants, the role-corrected and clean English
+  transcripts, the raw Hinglish evidence, and the run log. Raw evidence and the
+  run log are off by default.
+- One meeting downloads as a single file; several download as a `.zip` with one
+  file per meeting. Exports are owner-scoped and rate limited, and the JSON never
+  includes internal fields like the recording worker's lease.
+
 ## The fragile part (please read before filing a bug)
 
 Speaker names come from best-effort DOM scraping of the Meet UI, and Google
