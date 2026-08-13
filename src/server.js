@@ -31,6 +31,7 @@ import {
 } from "./domain/runner-jobs.js";
 import { isGoogleMeetUrl, sanitizeRawSegments, validateMeetingInput } from "./domain/validation.js";
 import {
+  ExportTooLargeError,
   MAX_EXPORT_MEETINGS,
   buildExportBundle,
   parseExportRequest,
@@ -637,11 +638,17 @@ async function route(request, response) {
       });
     }
 
-    const bundle = buildExportBundle({
-      meetings,
-      sections: parsed.value.sections,
-      format: parsed.value.format
-    });
+    let bundle;
+    try {
+      bundle = buildExportBundle({
+        meetings,
+        sections: parsed.value.sections,
+        format: parsed.value.format
+      });
+    } catch (error) {
+      if (!(error instanceof ExportTooLargeError)) throw error;
+      return sendJson(response, 413, { error: "export_too_large", message: error.message });
+    }
     return sendDownload(response, bundle);
   }
 

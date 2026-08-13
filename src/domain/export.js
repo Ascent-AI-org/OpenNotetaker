@@ -33,6 +33,18 @@ export const EXPORT_FORMATS = ["md", "json"];
 // once, so the request is capped rather than allowed to balloon the heap.
 export const MAX_EXPORT_MEETINGS = 200;
 
+// A meeting count is a poor proxy for cost: one two-hour call carries more transcript
+// than fifty short ones. This is the real ceiling, checked while rendering so a growing
+// history cannot turn one click into a heap spike on a box that has OOMed before.
+export const MAX_EXPORT_BYTES = 64 * 1024 * 1024;
+
+export class ExportTooLargeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ExportTooLargeError";
+  }
+}
+
 const SECTION_TITLES = {
   summary: "Summary",
   detailedNotes: "Detailed notes",
@@ -126,24 +138,38 @@ export function buildExportBundle({ meetings, sections = DEFAULT_EXPORT_SECTIONS
     : (meeting) => buildMeetingMarkdown(meeting, sections, now);
 
   if (meetings.length === 1) {
+    const body = Buffer.from(render(meetings[0]), "utf8");
+    assertWithinBudget(body.length);
     return {
       filename: exportFileName(meetings[0], meta.extension),
       contentType: meta.contentType,
-      body: Buffer.from(render(meetings[0]), "utf8")
+      body
     };
   }
 
   const used = new Map();
-  const entries = meetings.map((meeting) => ({
-    name: uniqueName(used, exportFileName(meeting, meta.extension)),
-    data: render(meeting)
-  }));
+  let bytes = 0;
+  const entries = meetings.map((meeting) => {
+    const data = Buffer.from(render(meeting), "utf8");
+    // Checked per meeting rather than at the end: the point is to stop before the heap
+    // is already full, not to report it afterwards.
+    bytes += data.length;
+    assertWithinBudget(bytes);
+    return { name: uniqueName(used, exportFileName(meeting, meta.extension)), data };
+  });
 
   return {
     filename: `opennotetaker-export-${isoDate(now)}.zip`,
     contentType: "application/zip",
     body: createZip(entries, { modifiedAt: now })
   };
+}
+
+function assertWithinBudget(bytes) {
+  if (bytes <= MAX_EXPORT_BYTES) return;
+  throw new ExportTooLargeError(
+    `This export is larger than ${Math.round(MAX_EXPORT_BYTES / (1024 * 1024))} MB. Pick fewer meetings or fewer sections.`
+  );
 }
 
 /** `2026-07-04-client-kickoff-call-11111111.md` */

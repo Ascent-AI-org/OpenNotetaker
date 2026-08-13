@@ -5,6 +5,7 @@ import { createZip } from "../src/domain/zip.js";
 import {
   DEFAULT_EXPORT_SECTIONS,
   EXPORT_SECTIONS,
+  ExportTooLargeError,
   buildExportBundle,
   buildMeetingJson,
   buildMeetingMarkdown,
@@ -299,6 +300,42 @@ test("meetings that would share a filename are disambiguated inside the zip", ()
 
   const names = readZipEntryNames(bundle.body);
   assert.equal(new Set(names).size, 2, `zip entry names must be unique, got ${names.join(", ")}`);
+});
+
+test("an export past the byte budget is refused instead of filling the heap", () => {
+  // One meeting whose transcript alone blows the budget.
+  const huge = sampleMeeting();
+  huge.artifacts.normalizedSegments = Array.from({ length: 40_000 }, (_, index) => ({
+    id: `seg-${index}`,
+    speaker: "Speaker 1",
+    start: index,
+    end: index + 1,
+    english: "x".repeat(2000)
+  }));
+
+  assert.throws(
+    () => buildExportBundle({ meetings: [huge], sections: ["cleanTranscript"], format: "md" }),
+    (error) => error instanceof ExportTooLargeError && /larger than 64 MB/u.test(error.message)
+  );
+});
+
+test("the byte budget also stops a many-meeting archive part way through", () => {
+  const bulky = () => {
+    const meeting = sampleMeeting({ id: `${Math.random()}`.slice(2, 14) });
+    meeting.artifacts.normalizedSegments = Array.from({ length: 12_000 }, (_, index) => ({
+      id: `seg-${index}`,
+      speaker: "Speaker 1",
+      start: index,
+      end: index + 1,
+      english: "y".repeat(2000)
+    }));
+    return meeting;
+  };
+
+  assert.throws(
+    () => buildExportBundle({ meetings: [bulky(), bulky(), bulky()], sections: ["cleanTranscript"], format: "md" }),
+    ExportTooLargeError
+  );
 });
 
 test("exporting nothing is refused rather than shipping an empty archive", () => {
