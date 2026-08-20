@@ -707,8 +707,11 @@ async function route(request, response) {
       });
     }
 
+    const body = await readJsonBody(request).catch(() => ({}));
+    const includeGuests = body?.includeGuests === true;
+
     try {
-      const delivery = await emailMeetingTranscript(meeting, { manual: true, force: true });
+      const delivery = await emailMeetingTranscript(meeting, { manual: true, force: true, includeGuests });
       return sendJson(response, 200, {
         meeting: store.getMeeting(meeting.id),
         delivery
@@ -923,14 +926,17 @@ function refinalizeMeeting(meeting, rawSegments) {
     .finally(() => runningJobs.delete(meeting.id));
 }
 
-async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
+async function emailMeetingTranscript(meeting, { manual, force = false, includeGuests = false } = {}) {
   if (!meeting || meeting.status !== "completed") return { status: "skipped", reason: "meeting_not_completed" };
   // Delivery is owner-scoped: the owner's recipients, the owner's Google connection.
   const owner = meeting.ownerId ? users.getUser(meeting.ownerId) : null;
   if (!owner) return { status: "skipped", reason: "no_owner" };
   if (!manual && !owner.settings?.autoEmailTranscript) return { status: "skipped", reason: "disabled" };
 
-  const recipients = transcriptRecipientsFor(owner);
+  const hostRecipients = transcriptRecipientsFor(owner);
+  // Guests are never emailed automatically; only a manual send with includeGuests opts in.
+  const guestRecipients = includeGuests ? guestRecipientsFor(meeting, hostRecipients) : [];
+  const recipients = dedupeEmails([...hostRecipients, ...guestRecipients]);
   const existing = meeting.delivery?.transcriptEmail;
   if (deliverySentToAll(existing, recipients) && !force) {
     return { status: "skipped", reason: "already_sent", sentAt: existing.sentAt };
@@ -987,6 +993,7 @@ async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
       status: "sent",
       recipient: recipients.join(", "),
       recipients,
+      guestRecipients,
       sentAt: new Date().toISOString(),
       providerMessageId: sentMessages[0]?.providerMessageId || "",
       providerMessageIds: sentMessages
@@ -1001,6 +1008,7 @@ async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
       status: "failed",
       recipient: recipients.join(", "),
       recipients,
+      guestRecipients,
       failedAt: new Date().toISOString(),
       error: error.message,
       providerMessageIds: sentMessages,
@@ -1031,6 +1039,34 @@ async function updateTranscriptEmailDelivery(meetingId, patch) {
 function transcriptRecipientsFor(owner) {
   const configured = owner.settings?.transcriptRecipients || [];
   return configured.length ? configured : [owner.email];
+}
+
+// Guest emails come from the calendar event's attendee list (synced separately),
+// never from user input at send time, so a sender can't email arbitrary addresses.
+function guestRecipientsFor(meeting, excludeEmails = []) {
+  const attendees = meeting.source?.googleCalendar?.attendees || [];
+  const excluded = new Set(excludeEmails.map((email) => String(email || "").toLowerCase()));
+  const seen = new Set();
+  const result = [];
+  for (const attendee of attendees) {
+    const email = validateEmail(attendee?.email);
+    if (!email || excluded.has(email) || seen.has(email)) continue;
+    seen.add(email);
+    result.push(email);
+  }
+  return result;
+}
+
+function dedupeEmails(emails) {
+  const seen = new Set();
+  const result = [];
+  for (const email of emails) {
+    const normalized = String(email || "").toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(email);
+  }
+  return result;
 }
 
 function deliverySentToAll(delivery, recipients) {
@@ -1443,9 +1479,30 @@ function createCalendarSource(event) {
       creatorEmail: event.creator?.email || "",
       originalStartTime: event.originalStartTime?.dateTime || event.originalStartTime?.date || "",
       eventUpdatedAt: event.updated || "",
-      lastSyncedAt: new Date().toISOString()
+      lastSyncedAt: new Date().toISOString(),
+      attendees: extractCalendarAttendees(event)
     }
   };
+}
+
+// Excludes the signed-in owner (attendee.self) and meeting rooms/resources, so this
+// list is exactly "everyone else invited" — the guest set offered on send.
+function extractCalendarAttendees(event) {
+  const attendees = Array.isArray(event.attendees) ? event.attendees : [];
+  const seen = new Set();
+  const result = [];
+  for (const attendee of attendees) {
+    if (attendee?.self || attendee?.resource) continue;
+    const email = validateEmail(attendee?.email);
+    if (!email || seen.has(email)) continue;
+    seen.add(email);
+    result.push({
+      email,
+      name: attendee.displayName || "",
+      responseStatus: attendee.responseStatus || "needsAction"
+    });
+  }
+  return result;
 }
 
 function mergeCalendarSource(meeting, source) {
