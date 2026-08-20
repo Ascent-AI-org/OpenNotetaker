@@ -10,6 +10,7 @@ const state = {
   pollTimer: null,
   runningStarts: new Set(),
   sendingEmails: new Set(),
+  includeGuests: true,
   syncingCalendar: false,
   openFolds: new Set(["transcript"]),
   export: null // initialised below, once EXPORT_SECTIONS exists
@@ -936,6 +937,13 @@ function renderDetail() {
         [...state.openFolds]
       ])
     : "empty";
+  // Guests are included by default whenever a new meeting is opened; a re-render for
+  // an unrelated reason (polling) keeps whatever the host already picked, and
+  // unticking the box is what opts a send out of reaching guests.
+  if (meeting && renderCache.detail !== cacheKey && meeting.id !== renderCache.detailMeetingId) {
+    state.includeGuests = true;
+  }
+  renderCache.detailMeetingId = meeting?.id || null;
   if (cacheKey === renderCache.detail) return;
   renderCache.detail = cacheKey;
 
@@ -989,6 +997,7 @@ function renderDetail() {
           }
           ${renderDurationMeta(meeting)}
         </div>
+        ${renderGuestEmailOption(meeting)}
         ${renderDeliveryNote(meeting)}
       </header>
 
@@ -1015,12 +1024,20 @@ function renderDetail() {
     }
   });
 
+  detail.querySelector("#guest-email-checkbox")?.addEventListener("change", (event) => {
+    state.includeGuests = event.target.checked;
+  });
+
   detail.querySelector("#email-button")?.addEventListener("click", async () => {
+    const includeGuests = state.includeGuests;
     state.sendingEmails.add(meeting.id);
     renderCache.detail = "";
     renderDetail();
     try {
-      await api(`/api/meetings/${meeting.id}/email-transcript`, { method: "POST" });
+      await api(`/api/meetings/${meeting.id}/email-transcript`, {
+        method: "POST",
+        body: JSON.stringify({ includeGuests })
+      });
       await refresh();
     } catch (error) {
       setAppError(error.message);
@@ -1030,6 +1047,22 @@ function renderDetail() {
       renderDetail();
     }
   });
+}
+
+function meetingGuests(meeting) {
+  return meeting.source?.googleCalendar?.attendees || [];
+}
+
+function renderGuestEmailOption(meeting) {
+  const guests = meetingGuests(meeting);
+  if (!guests.length) return "";
+  const names = guests.map((guest) => guest.name || guest.email).join(", ");
+  return `
+    <label class="switch-line" title="${escapeHtml(names)}">
+      <input type="checkbox" id="guest-email-checkbox" ${state.includeGuests ? "checked" : ""}>
+      Email guests too (${guests.length}): ${escapeHtml(names)}
+    </label>
+  `;
 }
 
 function renderStatusBanner(meeting) {
@@ -1515,7 +1548,10 @@ function renderDeliveryNote(meeting) {
     const recipients = Array.isArray(delivery.recipients) && delivery.recipients.length
       ? delivery.recipients.join(", ")
       : delivery.recipient;
-    return `<p class="delivery-note">Notes emailed to ${escapeHtml(recipients)} · ${escapeHtml(formatDayTime(delivery.sentAt))}</p>`;
+    const guestNote = delivery.guestRecipients?.length
+      ? ` (including ${delivery.guestRecipients.length} guest${delivery.guestRecipients.length === 1 ? "" : "s"})`
+      : "";
+    return `<p class="delivery-note">Notes emailed to ${escapeHtml(recipients)}${guestNote} · ${escapeHtml(formatDayTime(delivery.sentAt))}</p>`;
   }
   if (delivery.status === "failed") {
     return `<p class="delivery-note error">Email failed: ${escapeHtml(delivery.error || "unknown error")}</p>`;
