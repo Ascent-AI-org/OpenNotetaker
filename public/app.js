@@ -4,6 +4,11 @@ const state = {
   meetings: null, // null = not loaded yet (skeletons); [] = loaded, empty
   gmail: null,
   calendar: null,
+  googleAccounts: null,
+  // Meeting id -> in-progress action-item edits, so a re-render mid-edit does not
+  // discard what is being typed.
+  actionItemDrafts: new Map(),
+  editingActionItems: null,
   selectedId: null,
   view: "detail", // "detail" | "calendar"
   weekOffset: 0,
@@ -114,15 +119,18 @@ const createButton = $("#create-button");
 
 const settingsDialog = $("#settings-dialog");
 const gmailStatusText = $("#gmail-status-text");
-const gmailRecipientText = $("#gmail-recipient-text");
+const googleAccountsList = $("#google-accounts-list");
 const gmailConnect = $("#gmail-connect");
 const calendarStatusText = $("#calendar-status-text");
 const calendarMetaText = $("#calendar-meta-text");
 const calendarSyncButton = $("#calendar-sync");
 const settingsRecipients = $("#settings-recipients");
 const settingsAutoEmail = $("#settings-auto-email");
-const settingsCalendarSync = $("#settings-calendar-sync");
-const settingsCalendarAutostart = $("#settings-calendar-autostart");
+const settingsActionRecipients = $("#settings-action-recipients");
+const settingsEmailConnected = $("#settings-email-connected");
+const settingsActionConnected = $("#settings-action-connected");
+const settingsAutoActionItems = $("#settings-auto-action-items");
+const actionHoldHint = $("#action-hold-hint");
 const settingsSave = $("#settings-save");
 const settingsStatus = $("#settings-status");
 const passwordCurrent = $("#password-current");
@@ -148,6 +156,7 @@ newMeetingButton.addEventListener("click", openCreateDialog);
 settingsButton.addEventListener("click", openSettingsDialog);
 meetingForm.addEventListener("submit", handleCreateMeeting);
 settingsSave.addEventListener("click", saveSettings);
+settingsAutoActionItems?.addEventListener("change", renderActionHoldHint);
 passwordChange.addEventListener("click", changePassword);
 calendarSyncButton.addEventListener("click", syncCalendar);
 
@@ -596,6 +605,122 @@ async function refreshGmail() {
   renderSettingsStatuses();
 }
 
+async function refreshGoogleAccounts() {
+  try {
+    state.googleAccounts = await api("/api/google/accounts");
+  } catch (error) {
+    state.googleAccounts = { error: error.message, accounts: [] };
+  }
+  renderGoogleAccounts();
+  renderGoogleChip();
+}
+
+/* ---------- Connected Google accounts ---------- */
+
+function renderGoogleAccounts() {
+  const payload = state.googleAccounts;
+  if (!payload || !googleAccountsList) return;
+
+  if (payload.error) {
+    googleAccountsList.innerHTML = `<p class="settings-hint">${escapeHtml(payload.error)}</p>`;
+    return;
+  }
+  if (!payload.configured) {
+    googleAccountsList.innerHTML = `<p class="settings-hint">Add Google OAuth credentials on the server to connect accounts.</p>`;
+    return;
+  }
+  if (!payload.accounts.length) {
+    googleAccountsList.innerHTML = `<p class="settings-hint">No Google accounts connected yet. Connect one to import calendars and send notes.</p>`;
+    return;
+  }
+
+  googleAccountsList.innerHTML = payload.accounts
+    .map((account) => {
+      const flags = [
+        account.canReadCalendar ? "" : "no calendar access",
+        account.canSendMail ? "" : "cannot send mail",
+        account.emailVerified ? "" : "address unconfirmed — reconnect to fix"
+      ].filter(Boolean);
+
+      return `
+        <div class="account-row${account.needsReconnect ? " needs-reconnect" : ""}" data-account-id="${escapeHtml(account.id)}">
+          <div class="account-main">
+            <span class="account-email">${escapeHtml(account.email || "Connected account")}</span>
+            ${account.isDefault ? `<span class="account-badge">sends by default</span>` : ""}
+            ${account.needsReconnect ? `<span class="account-badge bad">reconnect needed</span>` : ""}
+            ${flags.length ? `<span class="account-meta">${escapeHtml(flags.join(" · "))}</span>` : ""}
+          </div>
+          <div class="account-toggles">
+            <label class="switch-line switch-line-sm">
+              <input type="checkbox" data-account-toggle="calendarSyncEnabled" ${account.calendarSyncEnabled ? "checked" : ""} ${account.canReadCalendar ? "" : "disabled"} />
+              <span>Import calendar</span>
+            </label>
+            <label class="switch-line switch-line-sm">
+              <input type="checkbox" data-account-toggle="calendarAutoStart" ${account.calendarAutoStart ? "checked" : ""} ${account.canReadCalendar ? "" : "disabled"} />
+              <span>Auto-join</span>
+            </label>
+            <label class="switch-line switch-line-sm">
+              <input type="checkbox" data-account-toggle="receivesNotes" ${account.receivesNotes ? "checked" : ""} />
+              <span>Receives notes</span>
+            </label>
+          </div>
+          <div class="account-actions">
+            ${account.isDefault ? "" : `<button class="btn btn-ghost btn-sm" type="button" data-account-action="default">Send from this</button>`}
+            <a class="btn btn-ghost btn-sm" href="/api/gmail/oauth/start">Reconnect</a>
+            <button class="btn btn-ghost btn-sm" type="button" data-account-action="disconnect">Disconnect</button>
+          </div>
+        </div>`;
+    })
+    .join("");
+}
+
+googleAccountsList?.addEventListener("change", async (event) => {
+  const toggle = event.target.closest("[data-account-toggle]");
+  if (!toggle) return;
+  const accountId = toggle.closest("[data-account-id]")?.dataset.id || toggle.closest(".account-row")?.dataset.accountId;
+  if (!accountId) return;
+  await patchGoogleAccount(accountId, { [toggle.dataset.accountToggle]: toggle.checked });
+});
+
+googleAccountsList?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-account-action]");
+  if (!button) return;
+  const row = button.closest(".account-row");
+  const accountId = row?.dataset.accountId;
+  if (!accountId) return;
+
+  if (button.dataset.accountAction === "default") {
+    await patchGoogleAccount(accountId, { isDefault: true });
+    return;
+  }
+  const email = row.querySelector(".account-email")?.textContent || "this account";
+  // Disconnecting revokes our copy of the credential — worth a confirm, since the only
+  // way back is a fresh OAuth round trip.
+  if (!confirm(`Disconnect ${email}? Its calendar will stop importing and it can no longer send notes.`)) return;
+  try {
+    state.googleAccounts = await api(`/api/google/accounts/${encodeURIComponent(accountId)}`, { method: "DELETE" });
+    renderGoogleAccounts();
+    renderGoogleChip();
+    await Promise.all([refreshGmail(), refreshCalendar()]);
+  } catch (error) {
+    setAppError(error.message);
+  }
+});
+
+async function patchGoogleAccount(accountId, patch) {
+  try {
+    state.googleAccounts = await api(`/api/google/accounts/${encodeURIComponent(accountId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch)
+    });
+    renderGoogleAccounts();
+    renderGoogleChip();
+  } catch (error) {
+    setAppError(error.message);
+    await refreshGoogleAccounts();
+  }
+}
+
 async function refreshCalendar() {
   try {
     state.calendar = await api("/api/calendar/status");
@@ -933,10 +1058,17 @@ function renderDetail() {
         state.runningStarts.has(meeting.id),
         state.sendingEmails.has(meeting.id),
         canEmailTranscript(meeting),
-        [...state.openFolds]
+        [...state.openFolds],
+        state.editingActionItems,
+        state.editingActionItems === meeting.id ? state.actionItemDrafts.get(meeting.id) : null
       ])
     : "empty";
   if (cacheKey === renderCache.detail) return;
+  // The list polls every 1.8s. Re-rendering the pane while the action-item editor is
+  // open would rebuild the inputs and steal the caret mid-word, so background refreshes
+  // are held off until the edit is saved or cancelled. Deliberate redraws clear
+  // renderCache.detail first and still get through.
+  if (meeting && state.editingActionItems === meeting.id && renderCache.detail !== "") return;
   renderCache.detail = cacheKey;
 
   if (!meeting) {
@@ -993,7 +1125,7 @@ function renderDetail() {
       </header>
 
       ${renderStatusBanner(meeting)}
-      ${notes ? renderNotes(notes) : ""}
+      ${notes ? renderNotes(notes, meeting) : ""}
       ${renderTranscript(meeting)}
       ${renderRunLog(meeting.events)}
     </div>
@@ -1015,6 +1147,8 @@ function renderDetail() {
     }
   });
 
+  wireActionItemControls(meeting);
+
   detail.querySelector("#email-button")?.addEventListener("click", async () => {
     state.sendingEmails.add(meeting.id);
     renderCache.detail = "";
@@ -1032,6 +1166,264 @@ function renderDetail() {
   });
 }
 
+function renderActionItemEditor(items) {
+  return `
+    <div class="items-editor" data-items-editor>
+      ${items
+        .map(
+          (item, index) => `
+            <div class="item-edit-row" data-item-index="${index}">
+              <textarea class="item-task" data-item-field="task" rows="2" placeholder="What was committed to">${escapeHtml(item.task || "")}</textarea>
+              <input class="item-owner" data-item-field="owner" value="${escapeHtml(item.owner || "")}" placeholder="Owner" />
+              <input class="item-due" data-item-field="due" value="${escapeHtml(item.due || "")}" placeholder="Due" />
+              <button class="btn btn-ghost btn-sm item-remove" type="button" data-item-remove aria-label="Remove item">Remove</button>
+            </div>`
+        )
+        .join("")}
+      ${items.length ? "" : `<p class="muted-note">No items. Add one, or save an empty list to clear it.</p>`}
+    </div>`;
+}
+
+// The delivery strip under the action items: who this is going to, when, and the
+// controls to change any of it before it does.
+function renderActionItemDelivery(meeting, items) {
+  if (!meeting || meeting.status !== "completed" || !items.length) return "";
+  const delivery = meeting.delivery?.actionItemsEmail || {};
+  const recipients = delivery.recipients || [];
+  const suggestions = attendeeSuggestionsFor(meeting, recipients);
+
+  let line;
+  if (delivery.status === "sent") {
+    line = `Sent to ${escapeHtml(recipients.join(", "))}${delivery.sentAt ? ` · ${escapeHtml(formatDayTime(delivery.sentAt))}` : ""}`;
+  } else if (delivery.status === "scheduled") {
+    line = `Sending to ${escapeHtml(recipients.join(", "))} at ${escapeHtml(formatDayTime(delivery.scheduledFor))}`;
+  } else if (delivery.status === "failed") {
+    line = `Send failed: ${escapeHtml(delivery.error || "unknown error")}`;
+  } else if (delivery.status === "cancelled") {
+    line = "Automatic send cancelled for this meeting.";
+  } else {
+    line = recipients.length
+      ? `Ready to send to ${escapeHtml(recipients.join(", "))}`
+      : "Not scheduled — add recipients to send these to the people who were in the meeting.";
+  }
+
+  return `
+    <div class="delivery-strip" data-delivery>
+      <div class="delivery-line">
+        <span class="delivery-status delivery-${escapeHtml(delivery.status || "idle")}">${line}</span>
+        <div class="sec-actions">
+          ${
+            delivery.status === "scheduled"
+              ? `<button class="btn btn-ghost btn-sm" type="button" data-delivery-cancel>Don't send</button>`
+              : ""
+          }
+          <button class="btn btn-secondary btn-sm" type="button" data-delivery-send>
+            ${delivery.status === "sent" ? "Send again" : "Send now"}
+          </button>
+        </div>
+      </div>
+      <div class="field delivery-field">
+        <label for="delivery-recipients">Send action items to</label>
+        <input id="delivery-recipients" data-delivery-recipients value="${escapeHtml(recipients.join(", "))}"
+               placeholder="name@company.com, another@company.com" />
+        <p class="field-hint">Comma separated. Blank means this meeting sends to nobody.</p>
+      </div>
+      ${
+        suggestions.length
+          ? `<div class="suggestions">
+              <p class="field-hint">On the calendar invite — click to add:</p>
+              <div class="suggestion-chips">
+                ${suggestions
+                  .map(
+                    (person) => `
+                      <button class="chip-add${person.external ? " external" : ""}" type="button"
+                              data-suggest-email="${escapeHtml(person.email)}"
+                              title="${escapeHtml(person.external ? "Outside your company" : "Same company")}">
+                        ${escapeHtml(person.name || person.email)}${person.external ? " ⚠" : ""}
+                      </button>`
+                  )
+                  .join("")}
+              </div>
+              <p class="field-hint">⚠ marks someone outside your company's domains.</p>
+            </div>`
+          : ""
+      }
+    </div>`;
+}
+
+// Attendees are suggestions only — nothing is emailed to them until they are on the
+// recipient list, which is a choice someone makes here.
+function attendeeSuggestionsFor(meeting, recipients) {
+  const attendees = meeting.source?.googleCalendar?.attendees || [];
+  if (!attendees.length) return [];
+  const already = new Set((recipients || []).map((email) => email.toLowerCase()));
+  const domains = new Set(
+    [state.user?.email, ...(state.googleAccounts?.accounts || []).map((account) => account.email)]
+      .filter(Boolean)
+      .map((email) => email.split("@").pop().toLowerCase())
+  );
+  return attendees
+    .filter((person) => person.email && !already.has(person.email.toLowerCase()))
+    .map((person) => ({
+      ...person,
+      external: !domains.has(String(person.email).split("@").pop().toLowerCase())
+    }));
+}
+
+function wireActionItemControls(meeting) {
+  const draftFor = () => state.actionItemDrafts.get(meeting.id) || meeting.artifacts?.notes?.actionItems || [];
+  const redraw = () => {
+    renderCache.detail = "";
+    renderDetail();
+  };
+
+  detail.querySelector("[data-items-edit]")?.addEventListener("click", () => {
+    state.editingActionItems = meeting.id;
+    state.actionItemDrafts.set(meeting.id, cloneItems(meeting.artifacts?.notes?.actionItems || []));
+    redraw();
+  });
+
+  detail.querySelector("[data-items-cancel]")?.addEventListener("click", () => {
+    state.editingActionItems = null;
+    state.actionItemDrafts.delete(meeting.id);
+    redraw();
+  });
+
+  detail.querySelector("[data-items-add]")?.addEventListener("click", () => {
+    state.actionItemDrafts.set(meeting.id, [...readEditorRows(), { task: "", owner: "", due: "", evidenceTimestamp: "" }]);
+    redraw();
+  });
+
+  detail.querySelector("[data-items-save]")?.addEventListener("click", async () => {
+    const actionItems = readEditorRows().filter((item) => item.task.trim());
+    try {
+      const { meeting: saved } = await api(`/api/meetings/${meeting.id}/action-items`, {
+        method: "PUT",
+        body: JSON.stringify({ actionItems })
+      });
+      state.editingActionItems = null;
+      state.actionItemDrafts.delete(meeting.id);
+      replaceMeeting(saved);
+      redraw();
+    } catch (error) {
+      setAppError(error.message);
+    }
+  });
+
+  detail.querySelector("[data-items-editor]")?.addEventListener("input", () => {
+    // Held in state rather than read only on save: a background poll re-renders the
+    // detail pane, and half-typed edits must survive that.
+    state.actionItemDrafts.set(meeting.id, readEditorRows());
+  });
+
+  detail.querySelectorAll("[data-item-remove]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.closest("[data-item-index]")?.dataset.itemIndex);
+      const rows = readEditorRows();
+      rows.splice(index, 1);
+      state.actionItemDrafts.set(meeting.id, rows);
+      redraw();
+    });
+  });
+
+  detail.querySelector("[data-delivery-send]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const recipients = splitEmails(detail.querySelector("[data-delivery-recipients]")?.value || "");
+    if (!recipients.length) {
+      setAppError("Add at least one recipient before sending action items.");
+      return;
+    }
+    const external = attendeeSuggestionsFor(meeting, []).filter(
+      (person) => person.external && recipients.includes(person.email.toLowerCase())
+    );
+    // Mail to someone outside the company cannot be recalled, so make that explicit
+    // once rather than trusting that the ⚠ was noticed.
+    if (
+      external.length &&
+      !confirm(
+        `${external.map((person) => person.email).join(", ")} ${external.length === 1 ? "is" : "are"} outside your company. Send them these action items?`
+      )
+    ) {
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = "Sending…";
+    try {
+      const { meeting: saved } = await api(`/api/meetings/${meeting.id}/send-action-items`, {
+        method: "POST",
+        body: JSON.stringify({ recipients })
+      });
+      replaceMeeting(saved);
+      redraw();
+    } catch (error) {
+      setAppError(error.message);
+      button.disabled = false;
+      button.textContent = "Send now";
+    }
+  });
+
+  detail.querySelector("[data-delivery-cancel]")?.addEventListener("click", async () => {
+    try {
+      const { meeting: saved } = await api(`/api/meetings/${meeting.id}/action-items/delivery`, {
+        method: "PATCH",
+        body: JSON.stringify({ autoSend: false })
+      });
+      replaceMeeting(saved);
+      redraw();
+    } catch (error) {
+      setAppError(error.message);
+    }
+  });
+
+  detail.querySelectorAll("[data-suggest-email]").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const input = detail.querySelector("[data-delivery-recipients]");
+      if (!input) return;
+      const recipients = new Set(splitEmails(input.value).map((email) => email.toLowerCase()));
+      recipients.add(chip.dataset.suggestEmail);
+      input.value = [...recipients].join(", ");
+      void persistDeliveryRecipients(meeting, [...recipients]);
+    });
+  });
+
+  detail.querySelector("[data-delivery-recipients]")?.addEventListener("change", (event) => {
+    void persistDeliveryRecipients(meeting, splitEmails(event.target.value));
+  });
+
+  function readEditorRows() {
+    const editor = detail.querySelector("[data-items-editor]");
+    if (!editor) return cloneItems(draftFor());
+    return [...editor.querySelectorAll("[data-item-index]")].map((row, index) => ({
+      ...(draftFor()[index] || {}),
+      task: row.querySelector('[data-item-field="task"]')?.value || "",
+      owner: row.querySelector('[data-item-field="owner"]')?.value || "",
+      due: row.querySelector('[data-item-field="due"]')?.value || ""
+    }));
+  }
+}
+
+async function persistDeliveryRecipients(meeting, recipients) {
+  try {
+    const { meeting: saved } = await api(`/api/meetings/${meeting.id}/action-items/delivery`, {
+      method: "PATCH",
+      body: JSON.stringify({ recipients })
+    });
+    replaceMeeting(saved);
+  } catch (error) {
+    setAppError(error.message);
+  }
+}
+
+function replaceMeeting(updated) {
+  if (!updated) return;
+  state.meetings = (state.meetings || []).map((item) => (item.id === updated.id ? updated : item));
+}
+
+function cloneItems(items) {
+  return items.map((item) => ({ ...item }));
+}
+
 function renderStatusBanner(meeting) {
   if (meeting.status === "failed") {
     return `<div class="failed-banner">${escapeHtml(meeting.statusMessage || "The notetaker job failed.")}</div>`;
@@ -1047,7 +1439,7 @@ function renderStatusBanner(meeting) {
   return "";
 }
 
-function renderNotes(notes) {
+function renderNotes(notes, meeting) {
   const actionItems = notes.actionItems || [];
   const triage = [
     { title: "Decisions", items: notes.decisions },
@@ -1055,34 +1447,55 @@ function renderNotes(notes) {
     { title: "Risks", items: notes.risks }
   ].filter((block) => block.items?.length);
 
+  const editing = state.editingActionItems === meeting?.id;
+  const rows = editing ? state.actionItemDrafts.get(meeting.id) || actionItems : actionItems;
+
   return `
     <section class="doc-section">
-      <div class="sec-label">Action items <span class="sec-count">${actionItems.length}</span></div>
+      <div class="sec-label-row">
+        <div class="sec-label">Action items <span class="sec-count">${rows.length}</span></div>
+        ${
+          meeting?.status === "completed"
+            ? editing
+              ? `<div class="sec-actions">
+                   <button class="btn btn-ghost btn-sm" type="button" data-items-cancel>Cancel</button>
+                   <button class="btn btn-secondary btn-sm" type="button" data-items-add>Add item</button>
+                   <button class="btn btn-primary btn-sm" type="button" data-items-save>Save</button>
+                 </div>`
+              : `<div class="sec-actions">
+                   <button class="btn btn-ghost btn-sm" type="button" data-items-edit>Edit</button>
+                 </div>`
+            : ""
+        }
+      </div>
       ${
-        actionItems.length
-          ? `<div class="table-wrap">
-              <table class="action-table">
-                <thead>
-                  <tr><th>Task</th><th>Owner</th><th>Due</th><th>At</th></tr>
-                </thead>
-                <tbody>
-                  ${actionItems
-                    .map(
-                      (item) => `
-                        <tr>
-                          <td class="cell-task">${escapeHtml(item.task)}</td>
-                          <td><span class="owner-chip${isKnownOwner(item.owner) ? " known" : ""}">${escapeHtml(item.owner || "Unknown")}</span></td>
-                          <td>${escapeHtml(item.due || "Not stated")}</td>
-                          <td class="cell-num">${escapeHtml(item.evidenceTimestamp || "")}</td>
-                        </tr>
-                      `
-                    )
-                    .join("")}
-                </tbody>
-              </table>
-            </div>`
-          : `<p class="muted-note">No commitments were made in this meeting.</p>`
+        editing
+          ? renderActionItemEditor(rows)
+          : rows.length
+            ? `<div class="table-wrap">
+                <table class="action-table">
+                  <thead>
+                    <tr><th>Task</th><th>Owner</th><th>Due</th><th>At</th></tr>
+                  </thead>
+                  <tbody>
+                    ${rows
+                      .map(
+                        (item) => `
+                          <tr>
+                            <td class="cell-task">${escapeHtml(item.task)}</td>
+                            <td><span class="owner-chip${isKnownOwner(item.owner) ? " known" : ""}">${escapeHtml(item.owner || "Unknown")}</span></td>
+                            <td>${escapeHtml(item.due || "Not stated")}</td>
+                            <td class="cell-num">${escapeHtml(item.evidenceTimestamp || "")}</td>
+                          </tr>
+                        `
+                      )
+                      .join("")}
+                  </tbody>
+                </table>
+              </div>`
+            : `<p class="muted-note">No commitments were made in this meeting.</p>`
       }
+      ${editing ? "" : renderActionItemDelivery(meeting, rows)}
     </section>
 
     <section class="doc-section">
@@ -1566,16 +1979,31 @@ function openSettingsDialog() {
   passwordStatus.textContent = "";
   renderSettingsStatuses();
   settingsDialog.showModal();
-  void Promise.all([refreshGmail(), refreshCalendar()]);
+  void Promise.all([refreshGmail(), refreshCalendar(), refreshGoogleAccounts()]);
 }
 
 function fillSettingsForm() {
   const settings = state.user?.settings;
   if (!settings) return;
   settingsRecipients.value = (settings.transcriptRecipients || []).join(", ");
+  settingsActionRecipients.value = (settings.actionItemRecipients || []).join(", ");
   settingsAutoEmail.checked = Boolean(settings.autoEmailTranscript);
-  settingsCalendarSync.checked = Boolean(settings.calendarSyncEnabled);
-  settingsCalendarAutostart.checked = Boolean(settings.calendarAutoStart);
+  settingsEmailConnected.checked = settings.emailConnectedAccounts !== false;
+  settingsActionConnected.checked = settings.actionItemsToConnectedAccounts !== false;
+  settingsAutoActionItems.checked = Boolean(settings.autoEmailActionItems);
+  renderActionHoldHint();
+}
+
+function renderActionHoldHint() {
+  if (!actionHoldHint) return;
+  const hold = state.googleAccounts?.actionItemsHoldMinutes;
+  if (!settingsAutoActionItems.checked) {
+    actionHoldHint.textContent = "Off — send action items yourself from the meeting.";
+    return;
+  }
+  actionHoldHint.textContent = hold
+    ? `Held ${hold} minutes after the notes are ready, so you can fix or cancel before it goes out.`
+    : "Sent as soon as the notes are ready.";
 }
 
 async function saveSettings() {
@@ -1584,19 +2012,18 @@ async function saveSettings() {
     const { user } = await api("/api/auth/settings", {
       method: "PATCH",
       body: JSON.stringify({
-        transcriptRecipients: settingsRecipients.value
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean),
+        transcriptRecipients: splitEmails(settingsRecipients.value),
+        actionItemRecipients: splitEmails(settingsActionRecipients.value),
         autoEmailTranscript: settingsAutoEmail.checked,
-        calendarSyncEnabled: settingsCalendarSync.checked,
-        calendarAutoStart: settingsCalendarAutostart.checked
+        emailConnectedAccounts: settingsEmailConnected.checked,
+        actionItemsToConnectedAccounts: settingsActionConnected.checked,
+        autoEmailActionItems: settingsAutoActionItems.checked
       })
     });
     state.user = user;
     fillSettingsForm();
     settingsStatus.textContent = "Saved.";
-    await Promise.all([refreshGmail(), refreshCalendar()]);
+    await Promise.all([refreshGmail(), refreshCalendar(), refreshGoogleAccounts()]);
   } catch (error) {
     settingsStatus.textContent = error.message;
   }
@@ -1671,19 +2098,17 @@ function renderSettingsStatuses({ keepCalendarMeta = false } = {}) {
   if (gmail) {
     if (gmail.error) {
       gmailStatusText.textContent = gmail.error;
-      gmailRecipientText.textContent = "";
     } else if (!gmail.configured) {
       gmailStatusText.textContent = "Add Google OAuth credentials on the server to enable Gmail.";
-      gmailRecipientText.textContent = "";
+    } else if (!gmail.accountCount) {
+      gmailStatusText.textContent = "Connect a Google account to import calendars and email notes.";
     } else {
-      gmailStatusText.textContent = gmail.connected
-        ? "Gmail connected — transcripts send from your account."
-        : gmail.googleConnected
-          ? "Reconnect Google to grant Gmail send access."
-          : "Connect Google to email transcripts.";
-      gmailRecipientText.textContent = gmail.recipient ? `Sending to ${gmail.recipient}` : "";
+      const count = `${gmail.accountCount} account${gmail.accountCount === 1 ? "" : "s"} connected`;
+      gmailStatusText.textContent = gmail.recipient
+        ? `${count}. Notes go to ${gmail.recipient}.`
+        : `${count}.`;
     }
-    gmailConnect.textContent = gmail.connected ? "Reconnect" : "Connect";
+    gmailConnect.textContent = gmail.accountCount ? "Connect another" : "Connect account";
     const usable = Boolean(gmail.configured && !gmail.error);
     gmailConnect.toggleAttribute("aria-disabled", !usable);
     gmailConnect.classList.toggle("btn-ghost", !usable);
@@ -1697,16 +2122,20 @@ function renderSettingsStatuses({ keepCalendarMeta = false } = {}) {
     } else if (!calendar.configured) {
       calendarStatusText.textContent = "Calendar needs the same Google OAuth credentials.";
     } else if (calendar.needsReconnect) {
-      calendarStatusText.textContent = `Google access expired — reconnect to resume calendar sync.${calendar.lastSyncError ? ` (${calendar.lastSyncError})` : ""}`;
+      // Name the account: "reconnect Google" is not actionable once several are connected.
+      const which = (calendar.reconnectAccounts || []).join(", ");
+      calendarStatusText.textContent = which
+        ? `${which} needs reconnecting before its calendar can sync again.`
+        : `Google access expired — reconnect to resume calendar sync.${calendar.lastSyncError ? ` (${calendar.lastSyncError})` : ""}`;
     } else if (!calendar.connected) {
       calendarStatusText.textContent = calendar.googleConnected
-        ? "Reconnect Google to grant Calendar read access."
-        : "Connect Google to import your meetings.";
+        ? "Turn on \u201cImport calendar\u201d for an account above to import its meetings."
+        : "Connect a Google account to import your meetings.";
     } else {
       const lastSync = calendar.lastSync ? `Last sync ${formatDayTime(calendar.lastSync)}.` : "";
-      calendarStatusText.textContent = calendar.enabled
-        ? `Calendar import is on. ${lastSync}`.trim()
-        : "Calendar connected — turn on import below.";
+      const syncing = calendar.syncingAccounts || [];
+      const which = syncing.length > 1 ? `${syncing.length} calendars importing` : "Calendar import is on";
+      calendarStatusText.textContent = `${which}. ${lastSync}`.trim();
     }
     if (!keepCalendarMeta) {
       calendarMetaText.textContent = calendar.lastError ? `Last error: ${calendar.lastError.message}` : "";
@@ -1780,6 +2209,13 @@ async function api(path, options = {}) {
     throw error;
   }
   return body;
+}
+
+function splitEmails(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function escapeHtml(value) {

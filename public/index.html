@@ -137,14 +137,12 @@
       </header>
 
       <section class="settings-section">
-        <h3>Google account</h3>
-        <div class="settings-row">
-          <div class="settings-row-text">
-            <p id="gmail-status-text" class="settings-status">Checking Gmail&hellip;</p>
-            <p id="gmail-recipient-text" class="settings-hint"></p>
-          </div>
-          <a id="gmail-connect" class="btn btn-secondary btn-sm" href="/api/gmail/oauth/start">Connect</a>
+        <div class="settings-head-row">
+          <h3>Google accounts</h3>
+          <a id="gmail-connect" class="btn btn-secondary btn-sm" href="/api/gmail/oauth/start">Connect account</a>
         </div>
+        <p id="gmail-status-text" class="settings-status">Checking Google&hellip;</p>
+        <div id="google-accounts-list" class="account-list"></div>
         <div class="settings-row">
           <div class="settings-row-text">
             <p id="calendar-status-text" class="settings-status">Checking Calendar&hellip;</p>
@@ -155,24 +153,47 @@
       </section>
 
       <section class="settings-section">
-        <h3>Notes delivery</h3>
+        <h3>Transcript delivery</h3>
+        <p class="settings-hint">The full record — summary, notes, and transcript. Goes to your own inboxes.</p>
         <div class="field">
-          <label for="settings-recipients">Email transcripts to</label>
+          <label for="settings-recipients">Also email transcripts to</label>
           <input id="settings-recipients" placeholder="Defaults to your account email" />
           <p class="field-hint">Comma separated. Sent from your connected Gmail.</p>
         </div>
         <label class="switch-line">
+          <input type="checkbox" id="settings-email-connected" />
+          <span>Send to every connected Google account</span>
+        </label>
+        <label class="switch-line">
           <input type="checkbox" id="settings-auto-email" />
-          <span>Email notes automatically when a meeting finishes</span>
+          <span>Email the transcript automatically when a meeting finishes</span>
+        </label>
+      </section>
+
+      <section class="settings-section">
+        <h3>Action item delivery</h3>
+        <p class="settings-hint">
+          A short list of what was committed to. This is the one that can go to other people, so it only
+          ever goes to addresses you list &mdash; attendees on a calendar invite are offered as
+          suggestions on the meeting, never added on their own.
+        </p>
+        <div class="field">
+          <label for="settings-action-recipients">Email action items to</label>
+          <input id="settings-action-recipients" placeholder="teammate@company.com, another@company.com" />
+          <p class="field-hint">Comma separated. Override this per meeting before it sends.</p>
+        </div>
+        <label class="switch-line">
+          <input type="checkbox" id="settings-action-connected" />
+          <span>Also send to every connected Google account</span>
         </label>
         <label class="switch-line">
-          <input type="checkbox" id="settings-calendar-sync" />
-          <span>Import my Google Calendar meetings</span>
+          <input type="checkbox" id="settings-auto-action-items" />
+          <span>Send action items automatically when a meeting finishes</span>
         </label>
-        <label class="switch-line">
-          <input type="checkbox" id="settings-calendar-autostart" />
-          <span>Send the bot automatically when a meeting starts</span>
-        </label>
+        <p class="field-hint" id="action-hold-hint"></p>
+      </section>
+
+      <section class="settings-section">
         <div class="settings-actions">
           <button id="settings-save" class="btn btn-primary btn-sm" type="button">Save</button>
           <p id="settings-status" class="settings-hint" role="status"></p>
