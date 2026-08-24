@@ -11,8 +11,7 @@ export class SlidingWindowRateLimiter {
 
   consume(key, nowMs = Date.now()) {
     this.maybePrune(nowMs);
-    const cutoff = nowMs - this.windowMs;
-    const timestamps = (this.hits.get(key) || []).filter((at) => at > cutoff);
+    const timestamps = this.live(key, nowMs);
     if (timestamps.length >= this.max) {
       this.hits.set(key, timestamps);
       return { allowed: false, retryAfterMs: timestamps[0] + this.windowMs - nowMs };
@@ -20,6 +19,23 @@ export class SlidingWindowRateLimiter {
     timestamps.push(nowMs);
     this.hits.set(key, timestamps);
     return { allowed: true, retryAfterMs: 0 };
+  }
+
+  // Read the budget without spending it, so a caller can reject an over-budget request
+  // up front while charging the counter only for the outcomes it actually wants to
+  // limit — failed logins, say, leaving successful ones free.
+  check(key, nowMs = Date.now()) {
+    const timestamps = this.live(key, nowMs);
+    if (timestamps.length >= this.max) {
+      return { allowed: false, retryAfterMs: timestamps[0] + this.windowMs - nowMs };
+    }
+    return { allowed: true, retryAfterMs: 0 };
+  }
+
+  // Timestamps still inside the window, oldest first.
+  live(key, nowMs) {
+    const cutoff = nowMs - this.windowMs;
+    return (this.hits.get(key) || []).filter((at) => at > cutoff);
   }
 
   maybePrune(nowMs) {
