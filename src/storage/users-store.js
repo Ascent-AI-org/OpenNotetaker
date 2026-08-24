@@ -10,8 +10,19 @@ const EMPTY_STATE = {
 export const DEFAULT_USER_SETTINGS = {
   transcriptRecipients: [],
   autoEmailTranscript: false,
+  // Calendar sync and autostart are now decided per connected Google account (see
+  // src/domain/google-accounts.js). These remain so that installations upgrading from
+  // the single-account layout keep their setting until it is migrated onto the account.
   calendarSyncEnabled: false,
-  calendarAutoStart: true
+  calendarAutoStart: true,
+  // Send the full transcript to every connected Google account's own address, on top of
+  // any addresses listed explicitly.
+  emailConnectedAccounts: true,
+  // Action items are a separate, shorter mailing that can go to other people, so it has
+  // its own recipient list and its own switch — both off until someone opts in.
+  actionItemRecipients: [],
+  actionItemsToConnectedAccounts: true,
+  autoEmailActionItems: false
 };
 
 export class UsersStore {

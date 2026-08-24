@@ -19,6 +19,32 @@ import {
   verifyPassword
 } from "./domain/auth.js";
 import { resolveClientIp } from "./domain/client-ip.js";
+import {
+  MAX_GOOGLE_ACCOUNTS,
+  calendarSyncAccounts,
+  findGoogleAccount,
+  listGoogleAccounts,
+  matchGoogleAccount,
+  pickSendingAccount,
+  publicGoogleAccount,
+  removeGoogleAccount,
+  setDefaultGoogleAccount,
+  updateGoogleAccount,
+  upsertGoogleAccount
+} from "./domain/google-accounts.js";
+import {
+  actionItemRecipients,
+  attendeeSuggestions,
+  parseRecipientList,
+  transcriptRecipients
+} from "./domain/note-delivery.js";
+import {
+  actionItemsChanged,
+  dueActionItemEmails,
+  parseActionItems,
+  scheduleActionItemsEmail
+} from "./domain/action-items.js";
+import { buildActionItemsEmail } from "./domain/action-items-email.js";
 import { SlidingWindowRateLimiter } from "./domain/rate-limit.js";
 import { JsonStore } from "./storage/json-store.js";
 import { UsersStore, publicUser } from "./storage/users-store.js";
@@ -41,12 +67,18 @@ import {
 import { buildTranscriptEmail } from "./domain/transcript-email.js";
 import {
   CALENDAR_READONLY_SCOPE,
+  GMAIL_SEND_SCOPE,
+  GOOGLE_IDENTITY_SCOPES,
+  GOOGLE_WORKSPACE_SCOPES,
   createGmailOAuthUrl,
   createMimeMessage,
   exchangeGmailCode,
   extractGoogleMeetUrl,
+  deleteGmailToken,
   fetchGoogleUserinfo,
+  getGoogleAccessToken,
   getGoogleTokenStatus,
+  loadGmailToken,
   hasUsableGmailToken,
   listCalendarEvents,
   saveGmailToken,
@@ -101,6 +133,11 @@ await store.load();
 const users = new UsersStore(config.storage.usersPath);
 await users.load();
 await users.pruneExpiredSessions();
+await migrateLegacyGoogleTokens().catch((error) => {
+  // A failed migration must not stop the server from booting; the legacy token file is
+  // left untouched, so the next boot retries.
+  console.error(`Google token migration failed: ${error.message}`);
+});
 
 const sessionTtlMs = config.auth.sessionTtlDays * 24 * 60 * 60 * 1000;
 // Session renewals persist at most this often to avoid a store write per request.
@@ -212,6 +249,8 @@ if (config.bot.provider === "fleet") {
   startLeaseSweeper();
 }
 
+startActionItemsSweeper();
+
 async function route(request, response) {
   const url = new URL(request.url, `http://${request.headers.host}`);
 
@@ -305,19 +344,20 @@ async function route(request, response) {
 
     const body = await readJsonBody(request);
     const settings = {};
-    if (Array.isArray(body.transcriptRecipients)) {
-      const recipients = [];
-      const seen = new Set();
-      for (const item of body.transcriptRecipients.slice(0, 10)) {
-        const email = validateEmail(item);
-        if (email && !seen.has(email)) {
-          seen.add(email);
-          recipients.push(email);
-        }
-      }
-      settings.transcriptRecipients = recipients;
+    for (const key of ["transcriptRecipients", "actionItemRecipients"]) {
+      if (!Array.isArray(body[key])) continue;
+      const parsed = parseRecipientList(body[key]);
+      if (!parsed.ok) return sendJson(response, 400, { error: "validation_error", message: parsed.error });
+      settings[key] = parsed.value;
     }
-    for (const key of ["autoEmailTranscript", "calendarSyncEnabled", "calendarAutoStart"]) {
+    for (const key of [
+      "autoEmailTranscript",
+      "autoEmailActionItems",
+      "emailConnectedAccounts",
+      "actionItemsToConnectedAccounts",
+      "calendarSyncEnabled",
+      "calendarAutoStart"
+    ]) {
       if (typeof body[key] === "boolean") settings[key] = body[key];
     }
     if (typeof body.name === "string") {
@@ -422,13 +462,12 @@ async function route(request, response) {
     if (!admin) return;
     const rows = [];
     for (const member of users.listUsers()) {
-      const tokenStatus = isGmailConfigured()
-        ? await getGoogleTokenStatus(userGoogleTokenPath(member.id))
-        : { connected: false };
+      const memberAccounts = isGmailConfigured() ? listGoogleAccounts(member) : [];
       rows.push({
         ...publicUser(member),
         lastLoginAt: member.lastLoginAt,
-        googleConnected: Boolean(tokenStatus.connected),
+        googleConnected: memberAccounts.length > 0,
+        googleAccountCount: memberAccounts.length,
         meetingCount: store.listMeetings().filter((meeting) => meeting.ownerId === member.id).length,
         pendingInvite: Boolean(
           member.passwordReset?.tokenHash && Date.parse(member.passwordReset.expiresAt || "") > Date.now()
@@ -508,6 +547,42 @@ async function route(request, response) {
     await users.deleteUserSessions(target.id);
     await users.removeUser(target.id);
     return sendJson(response, 200, { ok: true });
+  }
+
+  // ---- Connected Google accounts -------------------------------------------------
+  if (url.pathname === "/api/google/accounts" && request.method === "GET") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    return sendJson(response, 200, await googleAccountsPayload(user));
+  }
+
+  const googleAccountMatch = url.pathname.match(/^\/api\/google\/accounts\/([^/]+)$/);
+  if (googleAccountMatch && request.method === "PATCH") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    const account = findGoogleAccount(user, googleAccountMatch[1]);
+    if (!account) return sendJson(response, 404, { error: "not_found" });
+
+    const body = await readJsonBody(request);
+    let accounts = updateGoogleAccount(listGoogleAccounts(user), account.id, body);
+    if (body.isDefault === true) accounts = setDefaultGoogleAccount(accounts, account.id);
+    const updated = await users.updateUser(user.id, { googleAccounts: accounts });
+    return sendJson(response, 200, await googleAccountsPayload(updated));
+  }
+
+  if (googleAccountMatch && request.method === "DELETE") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    const account = findGoogleAccount(user, googleAccountMatch[1]);
+    if (!account) return sendJson(response, 404, { error: "not_found" });
+
+    // Remove the credential first: if the record were cleared first and this failed, a
+    // live refresh token would be left on disk with nothing pointing at it.
+    await deleteGmailToken(userGoogleTokenPath(user.id, account.id));
+    const updated = await users.updateUser(user.id, {
+      googleAccounts: removeGoogleAccount(listGoogleAccounts(user), account.id)
+    });
+    return sendJson(response, 200, await googleAccountsPayload(updated));
   }
 
   if (url.pathname === "/api/gmail/status" && request.method === "GET") {
@@ -630,13 +705,60 @@ async function route(request, response) {
       return;
     }
 
-    await saveGmailToken(userGoogleTokenPath(pending.userId), token);
-    // Granting calendar scope is a clear intent to import meetings, so switch the
-    // per-user sync toggle on. Autostart (a bot joining unattended) stays opt-in.
-    if (tokenHasScope(token, CALENDAR_READONLY_SCOPE)) {
-      await users.updateUser(pending.userId, { settings: { calendarSyncEnabled: true } });
+    // Identify the account before storing anything. Without this a second connection is
+    // indistinguishable from the first: we could not label it, could not tell a reconnect
+    // from a new account, and would overwrite one grant with another.
+    const info = await fetchGoogleUserinfo(token.access_token).catch(() => null);
+    const connectedEmail = validateEmail(info?.email);
+    if (!connectedEmail) {
+      return sendHtml(
+        response,
+        400,
+        "Google did not return which account was connected. Grant the email permission and try again."
+      );
     }
-    return sendHtml(response, 200, "Google connected. You can close this tab and return to OpenNotetaker.");
+
+    const owner = users.getUser(pending.userId);
+    const existingAccounts = listGoogleAccounts(owner);
+    const scopes = String(token.scope || "").split(/\s+/u).filter(Boolean);
+    const known = matchGoogleAccount(existingAccounts, { googleSub: info?.sub, email: connectedEmail });
+    const accountId = known?.id || randomUUID();
+
+    let accounts;
+    try {
+      accounts = upsertGoogleAccount(existingAccounts, {
+        id: accountId,
+        email: connectedEmail,
+        name: info?.name || "",
+        googleSub: info?.sub || "",
+        scopes
+      });
+    } catch (error) {
+      return sendHtml(response, 400, error.message);
+    }
+
+    await saveGmailToken(userGoogleTokenPath(pending.userId, accountId), token);
+    await users.updateUser(pending.userId, {
+      googleAccounts: accounts.map((account) =>
+        account.id === accountId
+          ? {
+              ...account,
+              emailVerified: true,
+              // Granting calendar scope is a clear intent to import this account's
+              // meetings. Autostart — a bot joining unattended — stays opt-in.
+              calendarSyncEnabled: known
+                ? account.calendarSyncEnabled
+                : scopes.includes(CALENDAR_READONLY_SCOPE)
+            }
+          : account
+      )
+    });
+
+    return sendHtml(
+      response,
+      200,
+      `${connectedEmail} is connected. You can close this tab and return to OpenNotetaker.`
+    );
   }
 
   if (url.pathname === "/api/meetings" && request.method === "GET") {
@@ -760,6 +882,98 @@ async function route(request, response) {
       meeting: store.getMeeting(meeting.id),
       message: "Notetaker job started."
     });
+  }
+
+  // Edit the extracted action items. They are LLM output, and the ones that are wrong
+  // are exactly the ones you do not want mailed to other people.
+  const actionItemsMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/action-items$/);
+  if (actionItemsMatch && request.method === "PUT") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    const meeting = getOwnedMeeting(actionItemsMatch[1], user);
+    if (!meeting) return sendJson(response, 404, { error: "not_found" });
+    if (!meeting.artifacts?.notes) {
+      return sendJson(response, 409, {
+        error: "notes_not_ready",
+        message: "Action items can be edited once the notes are generated."
+      });
+    }
+
+    const body = await readJsonBody(request);
+    const parsed = parseActionItems(body.actionItems);
+    if (!parsed.ok) return sendJson(response, 400, { error: "validation_error", message: parsed.error });
+
+    const before = meeting.artifacts.notes.actionItems || [];
+    if (!actionItemsChanged(before, parsed.value)) {
+      return sendJson(response, 200, { meeting, changed: false });
+    }
+
+    const updated = await store.updateMeeting(meeting.id, {
+      artifacts: {
+        notes: { ...meeting.artifacts.notes, actionItems: parsed.value, actionItemsEditedAt: new Date().toISOString() }
+      }
+    });
+    await store.appendEvent(meeting.id, {
+      type: "notes.action_items_edited",
+      message: `Action items edited by ${user.email}: ${before.length} → ${parsed.value.length}.`
+    });
+    return sendJson(response, 200, { meeting: store.getMeeting(meeting.id), changed: true });
+  }
+
+  // Recipients and the hold/cancel switch for this meeting's action-item email.
+  const actionItemsDeliveryMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/action-items\/delivery$/);
+  if (actionItemsDeliveryMatch && request.method === "PATCH") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    const meeting = getOwnedMeeting(actionItemsDeliveryMatch[1], user);
+    if (!meeting) return sendJson(response, 404, { error: "not_found" });
+
+    const body = await readJsonBody(request);
+    const patch = {};
+    if (body.recipients !== undefined) {
+      const parsed = parseRecipientList(body.recipients);
+      if (!parsed.ok) return sendJson(response, 400, { error: "validation_error", message: parsed.error });
+      patch.recipients = parsed.value;
+    }
+    if (typeof body.autoSend === "boolean") {
+      patch.autoSend = body.autoSend;
+      // Turning auto-send off must actually cancel a pending send, not just record a
+      // preference the sweeper then ignores.
+      if (!body.autoSend && meeting.delivery?.actionItemsEmail?.status === "scheduled") {
+        patch.status = "cancelled";
+        patch.scheduledFor = null;
+      }
+    }
+    if (!Object.keys(patch).length) {
+      return sendJson(response, 400, { error: "validation_error", message: "Nothing to update." });
+    }
+
+    const updated = await updateActionItemsDelivery(meeting.id, patch);
+    return sendJson(response, 200, { meeting: updated });
+  }
+
+  // Send now, ignoring any hold.
+  const sendActionItemsMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/send-action-items$/);
+  if (sendActionItemsMatch && request.method === "POST") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    const meeting = getOwnedMeeting(sendActionItemsMatch[1], user);
+    if (!meeting) return sendJson(response, 404, { error: "not_found" });
+
+    const body = await readJsonBody(request);
+    let overrideRecipients;
+    if (body.recipients !== undefined) {
+      const parsed = parseRecipientList(body.recipients, { allowEmpty: false });
+      if (!parsed.ok) return sendJson(response, 400, { error: "validation_error", message: parsed.error });
+      overrideRecipients = parsed.value;
+    }
+
+    try {
+      const delivery = await emailActionItems(meeting, { manual: true, overrideRecipients });
+      return sendJson(response, 200, { meeting: store.getMeeting(meeting.id), delivery });
+    } catch (error) {
+      return sendJson(response, 400, { error: "email_failed", message: error.message });
+    }
   }
 
   const emailTranscriptMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/email-transcript$/);
@@ -916,6 +1130,7 @@ async function route(request, response) {
         } catch (error) {
           console.error(error);
         }
+        await scheduleActionItemsFor(store.getMeeting(completed.id)).catch((error) => console.error(error));
         await propagateToFollowers(completed).catch((error) => console.error(error));
       })
       .catch(async (error) => {
@@ -953,6 +1168,7 @@ function startMeetingJob(meeting) {
       } catch (error) {
         console.error(error);
       }
+      await scheduleActionItemsFor(store.getMeeting(updated.id)).catch((error) => console.error(error));
       await propagateToFollowers(updated).catch((error) => console.error(error));
     })
     .catch(async (error) => {
@@ -982,6 +1198,7 @@ function refinalizeMeeting(meeting, rawSegments) {
       } catch (error) {
         console.error(error);
       }
+      await scheduleActionItemsFor(store.getMeeting(completed.id)).catch((error) => console.error(error));
       await propagateToFollowers(completed).catch((error) => console.error(error));
     })
     .catch(async (error) => {
@@ -1006,7 +1223,8 @@ async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
   if (!owner) return { status: "skipped", reason: "no_owner" };
   if (!manual && !owner.settings?.autoEmailTranscript) return { status: "skipped", reason: "disabled" };
 
-  const recipients = transcriptRecipientsFor(owner);
+  const accounts = listGoogleAccounts(owner);
+  const recipients = transcriptRecipients({ owner, accounts });
   const existing = meeting.delivery?.transcriptEmail;
   if (deliverySentToAll(existing, recipients) && !force) {
     return { status: "skipped", reason: "already_sent", sentAt: existing.sentAt };
@@ -1018,9 +1236,13 @@ async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
   if (!isGmailConfigured()) {
     throw new Error("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET before sending transcript email.");
   }
-  const tokenPath = userGoogleTokenPath(owner.id);
+  const sender = pickSendingAccount(accounts, { preferAccountIds: meetingAccountIds(meeting) });
+  if (!sender) {
+    throw new Error("Connect a Google account with Gmail access before sending transcript email.");
+  }
+  const tokenPath = userGoogleTokenPath(owner.id, sender.id);
   if (!(await hasUsableGmailToken(tokenPath))) {
-    throw new Error("Connect Google (Gmail) before sending transcript email.");
+    throw new Error(`Reconnect ${sender.email || "your Google account"} before sending transcript email.`);
   }
 
   const sentMessages = [];
@@ -1063,6 +1285,7 @@ async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
       status: "sent",
       recipient: recipients.join(", "),
       recipients,
+      sentFrom: sender.email,
       sentAt: new Date().toISOString(),
       providerMessageId: sentMessages[0]?.providerMessageId || "",
       providerMessageIds: sentMessages
@@ -1077,6 +1300,7 @@ async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
       status: "failed",
       recipient: recipients.join(", "),
       recipients,
+      sentFrom: sender.email,
       failedAt: new Date().toISOString(),
       error: error.message,
       providerMessageIds: sentMessages,
@@ -1088,6 +1312,153 @@ async function emailMeetingTranscript(meeting, { manual, force = false } = {}) {
     });
     throw error;
   }
+}
+
+/**
+ * Mail the action items for a meeting.
+ *
+ * Recipients come from the curated list only — never from the calendar attendee list on
+ * its own. Attendees are offered as suggestions in the UI; putting one on the list is a
+ * decision a person makes, so that a meeting with a client on it cannot mail them
+ * internal notes because nobody thought about it.
+ */
+async function emailActionItems(meeting, { manual = false, overrideRecipients } = {}) {
+  if (!meeting || meeting.status !== "completed") {
+    throw new Error("Action items can be sent once the meeting notes are completed.");
+  }
+  const owner = meeting.ownerId ? users.getUser(meeting.ownerId) : null;
+  if (!owner) return { status: "skipped", reason: "no_owner" };
+
+  const notes = meeting.artifacts?.notes;
+  const items = notes?.actionItems || [];
+  if (!items.length) {
+    if (manual) throw new Error("This meeting has no action items to send.");
+    return { status: "skipped", reason: "no_action_items" };
+  }
+
+  const accounts = listGoogleAccounts(owner);
+  const recipients = overrideRecipients || actionItemRecipients({ owner, accounts, meeting });
+  if (!recipients.length) {
+    if (manual) throw new Error("Add at least one recipient before sending action items.");
+    return { status: "skipped", reason: "no_recipients" };
+  }
+  if (!isGmailConfigured()) {
+    throw new Error("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET before sending action items.");
+  }
+
+  const sender = pickSendingAccount(accounts, { preferAccountIds: meetingAccountIds(meeting) });
+  if (!sender) throw new Error("Connect a Google account with Gmail access before sending action items.");
+  const tokenPath = userGoogleTokenPath(owner.id, sender.id);
+
+  const sent = [];
+  const failed = [];
+  for (const recipient of recipients) {
+    const message = createMimeMessage(
+      buildActionItemsEmail({
+        meeting,
+        recipient,
+        // Empty From: Gmail stamps the authenticated account, which is always correct.
+        from: "",
+        editedByUser: Boolean(notes?.actionItemsEditedAt)
+      })
+    );
+    try {
+      const result = await sendGmailMessage({ auth: getGoogleAuth(), tokenPath, message });
+      sent.push({ recipient, providerMessageId: result?.id || "" });
+    } catch (error) {
+      failed.push({ recipient, error: error.message });
+    }
+  }
+
+  const deliveredAt = new Date().toISOString();
+  if (!sent.length) {
+    await updateActionItemsDelivery(meeting.id, {
+      status: "failed",
+      scheduledFor: null,
+      failedAt: deliveredAt,
+      error: failed[0]?.error || "Action item email failed.",
+      failedRecipients: failed
+    });
+    await store.appendEvent(meeting.id, {
+      type: "action_items.email_failed",
+      message: failed[0]?.error || "Action item email failed."
+    });
+    throw new Error(failed[0]?.error || "Action item email failed.");
+  }
+
+  await updateActionItemsDelivery(meeting.id, {
+    // Partial success is still "sent" — the delivered copies cannot be unsent, and the
+    // failed list records exactly who still needs one.
+    status: "sent",
+    scheduledFor: null,
+    sentAt: deliveredAt,
+    sentFrom: sender.email,
+    recipients,
+    itemCount: items.length,
+    providerMessageIds: sent,
+    failedRecipients: failed
+  });
+  await store.appendEvent(meeting.id, {
+    type: "action_items.email_sent",
+    message: `${items.length} action item${items.length === 1 ? "" : "s"} sent to ${sent
+      .map((entry) => entry.recipient)
+      .join(", ")}${failed.length ? ` (failed for ${failed.map((entry) => entry.recipient).join(", ")})` : ""}.`
+  });
+  return { status: "sent", recipients: sent, failed };
+}
+
+async function updateActionItemsDelivery(meetingId, patch) {
+  const current = store.getMeeting(meetingId);
+  if (!current) return null;
+  return store.updateMeeting(meetingId, {
+    delivery: {
+      ...(current.delivery || {}),
+      actionItemsEmail: { ...(current.delivery?.actionItemsEmail || {}), ...patch }
+    }
+  });
+}
+
+/**
+ * Queue the automatic action-item email once notes are ready.
+ *
+ * Held for a configurable window rather than sent instantly: the list is editable
+ * precisely because some extracted items are wrong, and mail already delivered cannot be
+ * corrected. A hold of 0 sends on the next sweep for anyone who prefers speed.
+ */
+async function scheduleActionItemsFor(meeting) {
+  const owner = meeting?.ownerId ? users.getUser(meeting.ownerId) : null;
+  if (!owner) return;
+  const autoSend = owner.settings?.autoEmailActionItems === true;
+  const scheduledFor = scheduleActionItemsEmail({
+    meeting,
+    autoSend,
+    holdMinutes: config.email.actionItems.holdMinutes
+  });
+  if (!scheduledFor) return;
+
+  const recipients = actionItemRecipients({ owner, accounts: listGoogleAccounts(owner), meeting });
+  if (!recipients.length) return;
+
+  await updateActionItemsDelivery(meeting.id, { status: "scheduled", scheduledFor, recipients });
+  await store.appendEvent(meeting.id, {
+    type: "action_items.scheduled",
+    message: `Action items will be emailed to ${recipients.join(", ")} at ${scheduledFor}. Edit or cancel before then.`
+  });
+}
+
+// Sends action-item emails whose hold has elapsed. Persisted on the meeting rather than
+// held in a timer so a restart mid-hold still delivers.
+function startActionItemsSweeper() {
+  const timer = setInterval(async () => {
+    for (const meeting of dueActionItemEmails(store.listMeetings())) {
+      try {
+        await emailActionItems(meeting);
+      } catch (error) {
+        console.error(`action item email failed for ${meeting.id}: ${error.message}`);
+      }
+    }
+  }, 30_000);
+  timer.unref?.();
 }
 
 async function updateTranscriptEmailDelivery(meetingId, patch) {
@@ -1104,9 +1475,11 @@ async function updateTranscriptEmailDelivery(meetingId, patch) {
   });
 }
 
-function transcriptRecipientsFor(owner) {
-  const configured = owner.settings?.transcriptRecipients || [];
-  return configured.length ? configured : [owner.email];
+// Google account ids associated with a meeting, most specific first: the calendar
+// connection that imported it knows which inbox the thread belongs in.
+function meetingAccountIds(meeting) {
+  const accounts = meeting?.source?.googleCalendar?.accounts;
+  return Array.isArray(accounts) ? accounts.map((entry) => entry?.accountId).filter(Boolean) : [];
 }
 
 function deliverySentToAll(delivery, recipients) {
@@ -1118,14 +1491,40 @@ function deliverySentToAll(delivery, recipients) {
   return recipients.every((recipient) => normalizedSent.has(recipient.toLowerCase()));
 }
 
+async function googleAccountsPayload(user) {
+  const accounts = await resolveGoogleAccounts(user);
+  return {
+    configured: isGmailConfigured(),
+    maxAccounts: MAX_GOOGLE_ACCOUNTS,
+    schedulerEnabled: config.google.calendar.enabled,
+    actionItemsHoldMinutes: config.email.actionItems.holdMinutes,
+    accounts: accounts.map((account) => ({
+      ...publicGoogleAccount(account),
+      emailVerified: account.emailVerified !== false,
+      // Surfaced per account rather than globally: with several connections, "Google
+      // access expired" is only actionable if it says which one.
+      needsReconnect: CALENDAR_NEEDS_RECONNECT_CODES.has(
+        calendarRuntime.lastResult?.userErrors?.find(
+          (entry) => entry.userId === user.id && entry.accountId === account.id
+        )?.code
+      )
+    }))
+  };
+}
+
+// Aggregate across every connected account. "Connected" now means at least one account
+// can do the thing, and the per-account detail lives on /api/google/accounts.
 async function getGmailStatus(user) {
   const configured = isGmailConfigured();
-  const tokenStatus = configured ? await getGoogleTokenStatus(userGoogleTokenPath(user.id)) : null;
-  const recipients = transcriptRecipientsFor(user);
+  const accounts = configured ? await resolveGoogleAccounts(user) : [];
+  const recipients = transcriptRecipients({ owner: user, accounts });
+  const senders = accounts.filter((account) => account.scopes.includes(GMAIL_SEND_SCOPE));
   return {
     configured,
-    connected: Boolean(tokenStatus?.gmailSend),
-    googleConnected: Boolean(tokenStatus?.connected),
+    connected: senders.length > 0,
+    googleConnected: accounts.length > 0,
+    accountCount: accounts.length,
+    sendingAccounts: senders.map((account) => account.email).filter(Boolean),
     automaticTranscriptEmail: Boolean(user.settings?.autoEmailTranscript),
     recipient: recipients.join(", "),
     recipients,
@@ -1139,20 +1538,28 @@ const CALENDAR_NEEDS_RECONNECT_CODES = new Set(["invalid_grant", "no_refresh_tok
 
 async function getCalendarStatus(user) {
   const configured = isGmailConfigured();
-  const tokenStatus = configured ? await getGoogleTokenStatus(userGoogleTokenPath(user.id)) : null;
-  // tokenStatus only reflects the scope recorded at grant time, not whether the refresh
-  // token Google holds is still alive — that's only knowable once a real API call fails.
-  // The scheduler makes that call every pollSeconds regardless of whether anyone has the
-  // dashboard open, so its last result is what actually answers "is this still connected."
-  const myLastError = calendarRuntime.lastResult?.userErrors?.find((entry) => entry.userId === user.id) || null;
-  const needsReconnect = CALENDAR_NEEDS_RECONNECT_CODES.has(myLastError?.code);
+  const accounts = configured ? await resolveGoogleAccounts(user) : [];
+  // Recorded scope only reflects what was granted, not whether the refresh token Google
+  // holds is still alive — that is only knowable once a real API call fails. The
+  // scheduler makes that call every pollSeconds whether or not anyone has the dashboard
+  // open, so its last result is what actually answers "is this still connected."
+  const myErrors = (calendarRuntime.lastResult?.userErrors || []).filter((entry) => entry.userId === user.id);
+  const reconnectErrors = myErrors.filter((entry) => CALENDAR_NEEDS_RECONNECT_CODES.has(entry.code));
+  const syncing = calendarSyncAccounts(accounts);
+  const broken = new Set(reconnectErrors.map((entry) => entry.accountId));
+  const healthy = syncing.filter((account) => !broken.has(account.id));
   return {
     configured,
-    connected: Boolean(tokenStatus?.calendarReadonly) && !needsReconnect,
-    googleConnected: Boolean(tokenStatus?.connected),
-    needsReconnect,
-    lastSyncError: myLastError?.message || null,
-    enabled: Boolean(user.settings?.calendarSyncEnabled) && config.google.calendar.enabled,
+    connected: healthy.length > 0,
+    googleConnected: accounts.length > 0,
+    needsReconnect: reconnectErrors.length > 0,
+    // Named, because with several accounts connected "reconnect Google" is not actionable.
+    reconnectAccounts: reconnectErrors
+      .map((entry) => accounts.find((account) => account.id === entry.accountId)?.email)
+      .filter(Boolean),
+    syncingAccounts: syncing.map((account) => account.email).filter(Boolean),
+    lastSyncError: reconnectErrors[0]?.message || myErrors[0]?.message || null,
+    enabled: syncing.length > 0 && config.google.calendar.enabled,
     schedulerEnabled: config.google.calendar.enabled,
     autoStart: Boolean(user.settings?.calendarAutoStart) && config.google.calendar.autoStart,
     calendarId: config.google.calendar.calendarId,
@@ -1252,7 +1659,9 @@ function consumablePasswordReset(user, token) {
 // Gmail (send-to-self). Returns false when no usable connection exists.
 async function sendPasswordResetEmail(user, resetToken) {
   if (!isGmailConfigured()) return false;
-  const tokenPath = userGoogleTokenPath(user.id);
+  const sender = pickSendingAccount(listGoogleAccounts(user));
+  if (!sender) return false;
+  const tokenPath = userGoogleTokenPath(user.id, sender.id);
   const tokenStatus = await getGoogleTokenStatus(tokenPath);
   if (!tokenStatus.gmailSend) return false;
 
@@ -1295,8 +1704,104 @@ function getOwnedMeeting(id, user) {
   return meeting;
 }
 
-function userGoogleTokenPath(userId) {
-  return join(config.google.tokenDir, `${String(userId).replace(/[^a-zA-Z0-9-]/g, "")}.json`);
+// data/google-tokens/<userId>/<accountId>.json — one file per connected Google account.
+// Both ids are stripped to a safe alphabet before they touch a path: they are internal
+// UUIDs today, but a path built from a stored value is a traversal waiting to happen the
+// first time something upstream changes.
+function userGoogleTokenPath(userId, accountId) {
+  return join(config.google.tokenDir, safePathSegment(userId), `${safePathSegment(accountId)}.json`);
+}
+
+// Where a single-account installation kept its token before multi-account support.
+function legacyUserGoogleTokenPath(userId) {
+  return join(config.google.tokenDir, `${safePathSegment(userId)}.json`);
+}
+
+function safePathSegment(value) {
+  const safe = String(value).replace(/[^a-zA-Z0-9-]/gu, "");
+  if (!safe) throw new Error("Refusing to build a token path from an empty identifier.");
+  return safe;
+}
+
+/**
+ * Move pre-multi-account connections into the per-account layout.
+ *
+ * Runs once at boot. The old file has no identity attached — it predates the identity
+ * scopes — so the account is recorded with the address we do know (the user's own login)
+ * and marked unverified; the next connect or status check fills in the real address from
+ * Google. Doing nothing instead would silently disconnect every existing user.
+ */
+async function migrateLegacyGoogleTokens() {
+  for (const user of users.listUsers()) {
+    if (listGoogleAccounts(user).length) continue;
+
+    const legacyPath = legacyUserGoogleTokenPath(user.id);
+    const token = await loadGmailToken(legacyPath).catch(() => null);
+    if (!token) continue;
+
+    const accountId = randomUUID();
+    await saveGmailToken(userGoogleTokenPath(user.id, accountId), token);
+    await users.updateUser(user.id, {
+      googleAccounts: upsertGoogleAccount([], {
+        id: accountId,
+        email: user.email,
+        name: user.name || "",
+        googleSub: "",
+        scopes: String(token.scope || "").split(/\s+/u).filter(Boolean)
+      }).map((account) => ({
+        ...account,
+        // The address is a guess until Google confirms it; the UI says so.
+        emailVerified: false,
+        // Carry the old per-user calendar switches onto the migrated connection so
+        // sync behaviour does not change under anyone.
+        calendarSyncEnabled: Boolean(user.settings?.calendarSyncEnabled),
+        calendarAutoStart: Boolean(user.settings?.calendarAutoStart)
+      }))
+    });
+    await deleteGmailToken(legacyPath).catch(() => {});
+    console.log(`Migrated the Google connection for ${user.email} into the multi-account layout.`);
+  }
+}
+
+/**
+ * Fill in an account's real Google address, once, from the token we already hold.
+ *
+ * Migrated connections start with the user's login address as a placeholder. Rather than
+ * make everyone reconnect, resolve it the first time the account is looked at and cache
+ * the answer. Best-effort: a failure here must never block reading settings.
+ */
+async function ensureGoogleAccountIdentity(user, account) {
+  if (account.emailVerified !== false) return account;
+  try {
+    const accessToken = await getGoogleAccessToken({
+      auth: getGoogleAuth(),
+      tokenPath: userGoogleTokenPath(user.id, account.id)
+    });
+    const info = await fetchGoogleUserinfo(accessToken);
+    const email = validateEmail(info?.email);
+    if (!email) return account;
+    const updated = await users.updateUser(user.id, {
+      googleAccounts: listGoogleAccounts(users.getUser(user.id)).map((entry) =>
+        entry.id === account.id
+          ? { ...entry, email, name: info.name || entry.name, googleSub: info.sub || "", emailVerified: true }
+          : entry
+      )
+    });
+    return findGoogleAccount(updated, account.id) || account;
+  } catch {
+    return account;
+  }
+}
+
+/** Every connected account for a user, with migrated ones resolved on first read. */
+async function resolveGoogleAccounts(user) {
+  const accounts = listGoogleAccounts(user);
+  if (!accounts.some((account) => account.emailVerified === false)) return accounts;
+  const resolved = [];
+  for (const account of accounts) {
+    resolved.push(await ensureGoogleAccountIdentity(user, account));
+  }
+  return resolved;
 }
 
 function pruneOAuthStates() {
@@ -1338,51 +1843,61 @@ async function runCalendarSync(reason, { onlyUserId = null } = {}) {
       throw new Error("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET before syncing Google Calendar.");
     }
 
-    // Manual sync targets the requesting user; the scheduler targets every user who
-    // opted in via settings.
-    const targets = onlyUserId
-      ? [users.getUser(onlyUserId)].filter(Boolean)
-      : users.listUsers().filter((user) => user.settings?.calendarSyncEnabled);
+    // Manual sync targets the requesting user; the scheduler covers everyone. Which
+    // calendars get polled is now per connected Google account, not per user, so one
+    // person can watch a work calendar and a personal one and have both land here.
+    const targets = onlyUserId ? [users.getUser(onlyUserId)].filter(Boolean) : users.listUsers();
 
     const now = Date.now();
     let checkedEvents = 0;
+    let syncedAccounts = 0;
     const imported = [];
     const skipped = [];
     const userErrors = [];
 
     for (const user of targets) {
-      const tokenPath = userGoogleTokenPath(user.id);
-      const tokenStatus = await getGoogleTokenStatus(tokenPath);
-      if (!tokenStatus.calendarReadonly) {
-        if (onlyUserId) {
-          throw new Error("Reconnect Google to grant Calendar read-only access.");
-        }
-        userErrors.push({
-          userId: user.id,
-          code: "calendar_scope_missing",
-          message: "Reconnect Google to grant Calendar read-only access."
-        });
-        continue;
+      const accounts = calendarSyncAccounts(await resolveGoogleAccounts(user));
+      if (!accounts.length && onlyUserId) {
+        throw new Error("Connect a Google account with Calendar access, then enable calendar sync for it.");
       }
 
-      try {
-        const events = await listCalendarEvents({
-          auth: getGoogleAuth(),
-          tokenPath,
-          calendarId: config.google.calendar.calendarId,
-          timeMin: new Date(now - config.google.calendar.autoStartLateMinutes * 60_000).toISOString(),
-          timeMax: new Date(now + config.google.calendar.lookaheadMinutes * 60_000).toISOString(),
-          maxResults: 50
-        });
-        checkedEvents += events.length;
-        for (const event of events) {
-          const result = await upsertCalendarEventMeeting(event, user);
-          if (result?.meeting) imported.push(result);
-          else if (result?.reason) skipped.push(result.reason);
+      for (const account of accounts) {
+        const tokenPath = userGoogleTokenPath(user.id, account.id);
+        const tokenStatus = await getGoogleTokenStatus(tokenPath);
+        if (!tokenStatus.calendarReadonly) {
+          const message = `Reconnect ${account.email || "this Google account"} to grant Calendar read-only access.`;
+          if (onlyUserId) throw new Error(message);
+          userErrors.push({ userId: user.id, accountId: account.id, code: "calendar_scope_missing", message });
+          continue;
         }
-      } catch (error) {
-        if (onlyUserId) throw error;
-        userErrors.push({ userId: user.id, code: error.code || null, message: error.message });
+
+        try {
+          const events = await listCalendarEvents({
+            auth: getGoogleAuth(),
+            tokenPath,
+            calendarId: account.calendarId || config.google.calendar.calendarId,
+            timeMin: new Date(now - config.google.calendar.autoStartLateMinutes * 60_000).toISOString(),
+            timeMax: new Date(now + config.google.calendar.lookaheadMinutes * 60_000).toISOString(),
+            maxResults: 50
+          });
+          syncedAccounts += 1;
+          checkedEvents += events.length;
+          for (const event of events) {
+            const result = await upsertCalendarEventMeeting(event, user, account);
+            if (result?.meeting) imported.push(result);
+            else if (result?.reason) skipped.push(result.reason);
+          }
+        } catch (error) {
+          // One broken connection must not stop the others from syncing — that is the
+          // whole point of holding several.
+          if (onlyUserId && accounts.length === 1) throw error;
+          userErrors.push({
+            userId: user.id,
+            accountId: account.id,
+            code: error.code || null,
+            message: `${account.email || "Google account"}: ${error.message}`
+          });
+        }
       }
     }
 
@@ -1391,6 +1906,7 @@ async function runCalendarSync(reason, { onlyUserId = null } = {}) {
       status: "synced",
       reason,
       syncedUsers: targets.length,
+      syncedAccounts,
       checkedEvents,
       importedCount: imported.filter((item) => item.created).length,
       updatedCount: imported.filter((item) => !item.created).length,
@@ -1414,7 +1930,7 @@ async function runCalendarSync(reason, { onlyUserId = null } = {}) {
   }
 }
 
-async function upsertCalendarEventMeeting(event, owner) {
+async function upsertCalendarEventMeeting(event, owner, account) {
   if (!event || event.status === "cancelled") return { reason: "cancelled" };
 
   const meetUrl = extractGoogleMeetUrl(event);
@@ -1423,7 +1939,7 @@ async function upsertCalendarEventMeeting(event, owner) {
   const scheduledAt = event.start?.dateTime || "";
   if (!scheduledAt || Number.isNaN(Date.parse(scheduledAt))) return { reason: "all_day_or_invalid_start" };
 
-  const source = createCalendarSource(event);
+  const source = createCalendarSource(event, account);
   const existing = findCalendarMeeting(event, meetUrl, scheduledAt, owner.id);
   if (existing) {
     const patch = {
@@ -1467,9 +1983,15 @@ async function startDueCalendarMeetings() {
     if (meeting.status !== "scheduled") continue;
     if (runningJobs.has(meeting.id) || isActiveJobStatus(meeting.status)) continue;
 
-    // Autostart is opt-in per user on top of the global operator switch.
+    // Autostart is opt-in per connected account on top of the global operator switch:
+    // a work calendar can join automatically while a personal one never does.
     const owner = meeting.ownerId ? users.getUser(meeting.ownerId) : null;
-    if (!owner?.settings?.calendarAutoStart) continue;
+    if (!owner) continue;
+    const importingAccounts = new Set(meetingAccountIds(meeting));
+    const autoStartAllowed = listGoogleAccounts(owner).some(
+      (account) => importingAccounts.has(account.id) && account.calendarAutoStart
+    );
+    if (!autoStartAllowed) continue;
 
     const scheduled = Date.parse(meeting.scheduledAt);
     if (Number.isNaN(scheduled)) continue;
@@ -1504,11 +2026,11 @@ function findCalendarMeeting(event, meetUrl, scheduledAt, ownerId) {
   }) || null;
 }
 
-function createCalendarSource(event) {
+function createCalendarSource(event, account) {
   return {
     provider: "google_calendar",
     googleCalendar: {
-      calendarId: config.google.calendar.calendarId,
+      calendarId: account?.calendarId || config.google.calendar.calendarId,
       eventId: event.id || "",
       iCalUID: event.iCalUID || "",
       htmlLink: event.htmlLink || "",
@@ -1517,20 +2039,62 @@ function createCalendarSource(event) {
       creatorEmail: event.creator?.email || "",
       originalStartTime: event.originalStartTime?.dateTime || event.originalStartTime?.date || "",
       eventUpdatedAt: event.updated || "",
-      lastSyncedAt: new Date().toISOString()
+      lastSyncedAt: new Date().toISOString(),
+      // Which connected account saw this event. A list, because the same event can be on
+      // several connected calendars — the notes should still be one meeting, but any of
+      // those inboxes is a legitimate place to send from.
+      accounts: account ? [{ accountId: account.id, email: account.email }] : [],
+      // Stored so the UI can offer "everyone on the invite" as recipients. Never mailed
+      // without an explicit choice — see src/domain/note-delivery.js.
+      attendees: sanitizeAttendees(event.attendees)
     }
   };
 }
 
+// Attendee lists come from Google, but they are still external input landing in our
+// store and later rendered — cap the count and the field lengths.
+function sanitizeAttendees(value) {
+  if (!Array.isArray(value)) return [];
+  const attendees = [];
+  const seen = new Set();
+  for (const attendee of value.slice(0, 100)) {
+    const email = validateEmail(attendee?.email);
+    // Meeting rooms and other resources are attendees too, and nobody wants to mail a
+    // conference room.
+    if (!email || seen.has(email) || attendee?.resource === true) continue;
+    seen.add(email);
+    attendees.push({
+      email,
+      name: String(attendee?.displayName || "").trim().slice(0, 120),
+      responseStatus: String(attendee?.responseStatus || "").slice(0, 20),
+      organizer: Boolean(attendee?.organizer),
+      self: Boolean(attendee?.self)
+    });
+  }
+  return attendees;
+}
+
 function mergeCalendarSource(meeting, source) {
+  const existing = meeting.source?.googleCalendar || {};
   return {
     ...(meeting.source || {}),
     provider: "google_calendar",
     googleCalendar: {
-      ...(meeting.source?.googleCalendar || {}),
-      ...source.googleCalendar
+      ...existing,
+      ...source.googleCalendar,
+      // Union rather than overwrite: a second connected account seeing the same event
+      // should be added to the list, not replace the account that imported it first.
+      accounts: mergeCalendarAccounts(existing.accounts, source.googleCalendar.accounts)
     }
   };
+}
+
+function mergeCalendarAccounts(existing, incoming) {
+  const byId = new Map();
+  for (const entry of [...(existing || []), ...(incoming || [])]) {
+    if (entry?.accountId) byId.set(entry.accountId, entry);
+  }
+  return [...byId.values()];
 }
 
 function getGoogleAuth() {
@@ -1641,6 +2205,7 @@ function startLeaseSweeper() {
             finalizeRawTranscript({ meeting, store, config, rawSegments })
               .then(async (completed) => {
                 await emailMeetingTranscript(completed, { manual: false }).catch((error) => console.error(error));
+                await scheduleActionItemsFor(store.getMeeting(completed.id)).catch((error) => console.error(error));
                 await propagateToFollowers(completed).catch((error) => console.error(error));
               })
               .catch(async (error) => {
@@ -1730,6 +2295,7 @@ async function propagateToFollowers(primary) {
         message: "Notes copied from the shared recording of this meeting."
       });
       await emailMeetingTranscript(copied, { manual: false }).catch((error) => console.error(error));
+      await scheduleActionItemsFor(store.getMeeting(follower.id)).catch((error) => console.error(error));
     } catch (error) {
       console.error(error);
     }

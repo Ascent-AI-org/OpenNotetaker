@@ -1,10 +1,19 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
 export const GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send";
 export const CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
-export const GOOGLE_WORKSPACE_SCOPES = [GMAIL_SEND_SCOPE, CALENDAR_READONLY_SCOPE];
+// Identity scopes are requested alongside the workspace ones on every connect. Without
+// them a grant is anonymous: with several accounts connected to one user we could not
+// tell which inbox a token belongs to, label it in the UI, or recognise a reconnect of
+// an account we already hold rather than creating a duplicate.
+export const GOOGLE_IDENTITY_SCOPES = ["openid", "email", "profile"];
+export const GOOGLE_WORKSPACE_SCOPES = [
+  ...GOOGLE_IDENTITY_SCOPES,
+  GMAIL_SEND_SCOPE,
+  CALENDAR_READONLY_SCOPE
+];
 
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -49,6 +58,18 @@ export async function saveGmailToken(tokenPath, token) {
   const tempPath = `${tokenPath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(token, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await rename(tempPath, tokenPath);
+}
+
+// Disconnecting must actually remove the credential, not just forget the pointer to it:
+// a refresh token left on disk is a live grant to that person's mail and calendar.
+export async function deleteGmailToken(tokenPath) {
+  try {
+    await rm(tokenPath, { force: true });
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export async function hasUsableGmailToken(tokenPath) {
