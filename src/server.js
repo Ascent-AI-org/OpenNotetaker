@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { extname, join, resolve } from "node:path";
+import { extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertProviderSecrets, readConfig } from "./config.js";
 import {
@@ -18,6 +18,7 @@ import {
   validatePassword,
   verifyPassword
 } from "./domain/auth.js";
+import { resolveClientIp } from "./domain/client-ip.js";
 import { SlidingWindowRateLimiter } from "./domain/rate-limit.js";
 import { JsonStore } from "./storage/json-store.js";
 import { UsersStore, publicUser } from "./storage/users-store.js";
@@ -56,8 +57,6 @@ import {
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const rootDir = resolve(__dirname, "..");
 const publicDir = join(rootDir, "public");
-const dataPath = join(rootDir, "data", "meetings.json");
-const usersPath = join(rootDir, "data", "users.json");
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -67,13 +66,39 @@ const MIME_TYPES = {
   ".svg": "image/svg+xml"
 };
 
+// Sent on every response. The dashboard shows meeting transcripts and drives account
+// and Google-connection actions, so it must not be framable (clickjacking) and its
+// URLs — which carry meeting ids and invite codes — must not leak to third parties.
+//
+// The CSP is the backstop for the escaping in public/app.js: script-src 'self' means a
+// stored transcript that slipped through as markup still cannot execute. 'unsafe-inline'
+// is present for styles only, because the calendar grid positions events with inline
+// style attributes; it does not weaken the script protection.
+const SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy": [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "object-src 'none'"
+  ].join("; ")
+};
+
 const config = readConfig();
 assertProviderSecrets(config);
 
-const store = new JsonStore(dataPath);
+const store = new JsonStore(config.storage.meetingsPath);
 await store.load();
 
-const users = new UsersStore(usersPath);
+const users = new UsersStore(config.storage.usersPath);
 await users.load();
 await users.pruneExpiredSessions();
 
@@ -83,6 +108,18 @@ const SESSION_TOUCH_INTERVAL_MS = 60 * 60 * 1000;
 
 // In-memory limiters: single-process only; move to Redis before running replicas.
 const loginIpLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
+// Keyed by email alone, not by (ip, email): an attacker spraying one account from many
+// addresses would otherwise get the full per-account budget from every address, which
+// is no per-account limit at all.
+//
+// Only failed attempts are charged, so ordinary use — signing in from several devices,
+// re-authenticating often — never spends the budget. The budget is still checked before
+// the password is verified, because verifying costs a deliberate ~100ms of scrypt and
+// answering that for every attempt is its own denial of service.
+//
+// The accepted trade-off: eight wrong guesses lock that one account out for the rest of
+// the window, for its real owner too. It self-heals in 15 minutes, and the alternative —
+// verifying first so the owner always gets in — hands an attacker unbounded scrypt work.
 const loginAccountLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, max: 8 });
 const signupIpLimiter = new SlidingWindowRateLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
 const passwordResetLimiter = new SlidingWindowRateLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
@@ -123,10 +160,38 @@ const calendarRuntime = {
   timer: null
 };
 
+// A fault the client caused and can fix, carrying the status and code to answer with.
+class HttpError extends Error {
+  constructor(statusCode, code, message) {
+    super(message);
+    this.name = "HttpError";
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
 const server = createServer(async (request, response) => {
   try {
     await route(request, response);
   } catch (error) {
+    // Nothing can be said once the status line is out; writing again throws a second,
+    // more confusing error on top of the first.
+    if (response.headersSent) {
+      console.error(error);
+      response.destroy();
+      return;
+    }
+    // Answering before the request body has been fully read — which is the whole point
+    // of the 413 — leaves unread bytes on the socket. Keeping it alive would feed those
+    // bytes to the next request on the same connection, so the client sees the reset on
+    // an unrelated later call. Close it instead: the response still arrives intact.
+    if (!request.readableEnded) {
+      response.setHeader("Connection", "close");
+    }
+    if (error instanceof HttpError) {
+      // Client errors are expected traffic; they don't belong in the error log.
+      return sendJson(response, error.statusCode, { error: error.code, message: error.message });
+    }
     console.error(error);
     sendJson(response, 500, {
       error: "internal_error",
@@ -200,7 +265,7 @@ async function route(request, response) {
 
     const body = await readJsonBody(request);
     const email = validateEmail(body.email);
-    if (email && !loginAccountLimiter.consume(`${ip}:${email}`).allowed) {
+    if (email && !loginAccountLimiter.check(email).allowed) {
       return sendJson(response, 429, { error: "rate_limited", message: "Too many login attempts for this account. Try later." });
     }
 
@@ -210,6 +275,9 @@ async function route(request, response) {
     const passwordHash = user?.passwordHash || (await DUMMY_PASSWORD_HASH_PROMISE);
     const valid = await verifyPassword(body.password || "", passwordHash);
     if (!user || !valid) {
+      // Charged on failure only. Unknown emails are charged too, so probing for valid
+      // addresses costs the same as guessing a password for a known one.
+      if (email) loginAccountLimiter.consume(email);
       return sendJson(response, 401, { error: "invalid_credentials", message: "Invalid email or password." });
     }
 
@@ -805,8 +873,12 @@ async function route(request, response) {
     }
 
     // Runners flush deltas during the meeting so a crash loses at most one batch;
-    // merging by id keeps retries idempotent.
-    const merged = mergeSegmentsById(meeting.artifacts?.rawSegments || [], sanitized.value);
+    // merging by id keeps retries idempotent. Re-read the meeting instead of reusing the
+    // copy captured above: several awaits have happened since, and two flushes racing on
+    // a stale base would each write only their own batch, dropping the other's segments.
+    const current = store.getMeeting(meeting.id);
+    if (!current) return sendJson(response, 404, { error: "not_found" });
+    const merged = mergeSegmentsById(current.artifacts?.rawSegments || [], sanitized.value);
     await store.updateMeeting(meeting.id, { artifacts: { rawSegments: merged.segments } });
     return sendJson(response, 202, {
       accepted: merged.added,
@@ -830,8 +902,12 @@ async function route(request, response) {
     }
 
     // The final submission is merged with the segments flushed during the meeting, so
-    // finalization works from whichever copy survived (incremental or final).
-    const merged = mergeSegmentsById(meeting.artifacts?.rawSegments || [], sanitized.value);
+    // finalization works from whichever copy survived (incremental or final). Re-read for
+    // the same reason as the segments endpoint: a flush may have landed while this body
+    // was still being read.
+    const latest = store.getMeeting(meeting.id);
+    if (!latest) return sendJson(response, 404, { error: "not_found" });
+    const merged = mergeSegmentsById(latest.artifacts?.rawSegments || [], sanitized.value);
 
     finalizeRawTranscript({ meeting, store, config, rawSegments: merged.segments })
       .then(async (completed) => {
@@ -1198,9 +1274,7 @@ async function sendPasswordResetEmail(user, resetToken) {
 }
 
 function clientIp(request) {
-  // The direct socket address. Do not trust X-Forwarded-For here until a trusted
-  // reverse proxy is part of the deployment and made explicit in config.
-  return request.socket.remoteAddress || "unknown";
+  return resolveClientIp(request, config.server.trustProxyHops);
 }
 
 function isSameOrigin(request) {
@@ -1474,7 +1548,9 @@ function truncateTitle(value) {
 async function serveStatic(pathname, response) {
   const safePath = pathname === "/" ? "/index.html" : pathname;
   const filePath = resolve(publicDir, `.${safePath}`);
-  if (!filePath.startsWith(publicDir)) {
+  // Compare against publicDir + separator: a bare startsWith would also accept a
+  // sibling directory whose name merely begins with it (…/public-backup).
+  if (filePath !== publicDir && !filePath.startsWith(publicDir + sep)) {
     return sendJson(response, 403, { error: "forbidden" });
   }
 
@@ -1482,15 +1558,18 @@ async function serveStatic(pathname, response) {
     const data = await readFile(filePath);
     response.writeHead(200, {
       "Content-Type": MIME_TYPES[extname(filePath)] || "application/octet-stream",
-      "Cache-Control": "no-store"
+      "Cache-Control": "no-store",
+      ...SECURITY_HEADERS
     });
     response.end(data);
   } catch (error) {
     if (error.code === "ENOENT") {
+      // SPA fallback: unknown paths render the app shell, which routes client-side.
       const index = await readFile(join(publicDir, "index.html"));
       response.writeHead(200, {
         "Content-Type": MIME_TYPES[".html"],
-        "Cache-Control": "no-store"
+        "Cache-Control": "no-store",
+        ...SECURITY_HEADERS
       });
       response.end(index);
       return;
@@ -1499,18 +1578,33 @@ async function serveStatic(pathname, response) {
   }
 }
 
+// A client sending junk is a client error, not a server error. Thrown as HttpError so
+// the top-level handler answers 400/413 instead of logging a stack trace and returning
+// "Something went wrong" — which reads as an outage and buries real 500s in the noise.
 async function readJsonBody(request, { maxBytes = 1024 * 1024 } = {}) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
     if (size > maxBytes) {
-      throw new Error("Request body too large.");
+      throw new HttpError(413, "payload_too_large", `Request body exceeds ${maxBytes} bytes.`);
     }
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new HttpError(400, "invalid_json", "Request body must be valid JSON.");
+  }
+  // Every caller reads named fields off this value; a bare array, string, or null would
+  // otherwise sail through validation as an object with all-undefined fields.
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new HttpError(400, "invalid_json", "Request body must be a JSON object.");
+  }
+  return parsed;
 }
 
 async function renewRunnerLease(meeting) {
@@ -1660,7 +1754,7 @@ function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff"
+    ...SECURITY_HEADERS
   });
   response.end(JSON.stringify(payload));
 }
@@ -1674,7 +1768,7 @@ function sendDownload(response, { filename, contentType, body }) {
     "Content-Length": body.length,
     "Content-Disposition": `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`,
     "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff"
+    ...SECURITY_HEADERS
   });
   response.end(body);
 }
@@ -1683,7 +1777,7 @@ function sendHtml(response, statusCode, message) {
   response.writeHead(statusCode, {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff"
+    ...SECURITY_HEADERS
   });
   response.end(`<!doctype html><html><body><p>${escapeHtml(message)}</p></body></html>`);
 }

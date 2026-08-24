@@ -96,6 +96,21 @@ export class JsonStore {
       },
       updatedAt: new Date().toISOString()
     };
+    // Retention is a ceiling on how long the verbatim transcript is kept, so the clock
+    // has to start when that transcript first exists — not when the meeting record was
+    // created. Stamped here because every write path (runner segment flushes, pipeline
+    // finalization, follower copies) funnels through updateMeeting, so no caller can
+    // forget it. Records written before this stamp existed fall back to createdAt.
+    const hadSegments = (current.artifacts?.rawSegments?.length || 0) > 0;
+    const hasSegments = (next.artifacts?.rawSegments?.length || 0) > 0;
+    if (!hadSegments && hasSegments) {
+      // An explicit value in the patch wins, so a backfill can date an imported
+      // transcript correctly instead of resetting its clock to the import.
+      next.transcriptCapturedAt = patch.transcriptCapturedAt ?? next.updatedAt;
+      // A re-recorded meeting starts a fresh window; leaving the old marker in place
+      // would exempt the new transcript from retention forever.
+      next.artifactsPurgedAt = patch.artifactsPurgedAt ?? null;
+    }
     this.state.meetings[index] = next;
     await this.persist();
     return next;
@@ -115,12 +130,13 @@ export class JsonStore {
     });
   }
 
-  // Clears the raw/normalized transcript once a meeting is past its configured
-  // retentionDays, so the store (loaded fully into memory and rewritten in full on
-  // every persist()) doesn't grow without bound. The meeting record and its
-  // generated notes survive; only the bulky verbatim transcript is purged. Never
-  // touches meetings still mid-recording (isActiveStatus) or already purged, and
-  // batches every change into a single persist() instead of one per meeting.
+  // Clears the raw/normalized transcript once the transcript itself is past the
+  // meeting's configured retentionDays, so the store (loaded fully into memory and
+  // rewritten in full on every persist()) doesn't grow without bound. The meeting
+  // record and its generated notes survive; only the bulky verbatim transcript is
+  // purged. Never touches meetings still mid-recording (isActiveStatus) or already
+  // purged, and batches every change into a single persist() instead of one per
+  // meeting.
   async pruneExpiredArtifacts(now, { isActiveStatus }) {
     let prunedCount = 0;
     for (const meeting of this.state.meetings) {
@@ -132,7 +148,7 @@ export class JsonStore {
       if (rawCount === 0 && normalizedCount === 0) continue;
 
       const retentionDays = Number.isInteger(meeting.retentionDays) ? meeting.retentionDays : 30;
-      const ageMs = now - new Date(meeting.createdAt).getTime();
+      const ageMs = now - retentionAnchorMs(meeting);
       if (!(ageMs >= retentionDays * 24 * 60 * 60 * 1000)) continue;
 
       const purgedAt = new Date(now).toISOString();
@@ -165,4 +181,14 @@ export class JsonStore {
     this.writeQueue = write;
     return write;
   }
+}
+
+// When the retention clock starts for a meeting's transcript. Prefer the moment the
+// transcript was first captured; fall back to createdAt for records written before
+// that stamp existed, and for meetings whose stamp is unparseable.
+function retentionAnchorMs(meeting) {
+  const captured = Date.parse(meeting.transcriptCapturedAt || "");
+  if (Number.isFinite(captured)) return captured;
+  const created = Date.parse(meeting.createdAt || "");
+  return Number.isFinite(created) ? created : 0;
 }

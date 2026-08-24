@@ -5,7 +5,7 @@ import { readConfig } from "../src/config.js";
 // (e.g. an old finalization failure). This resubmits the stored raw transcript through
 // the same server endpoint a recording worker uses, so the current server-side pipeline
 // (resilient reconstruction, chunked notes) runs and the server owns the status
-// transitions. Run it from the repo root, or inside the web container:
+// transitions. Run it from anywhere, or inside the web container:
 //   node scripts/finalize-stuck-meeting.mjs <meeting-id> [base-url]
 
 const args = process.argv.slice(2);
@@ -21,7 +21,9 @@ if (!config.runner.token) {
   throw new Error("RUNNER_TOKEN is missing.");
 }
 
-const data = JSON.parse(readFileSync("data/meetings.json", "utf8"));
+// Resolved from config so DATA_DIR is honoured and the script does not depend on the
+// directory it happens to be run from.
+const data = JSON.parse(readFileSync(config.storage.meetingsPath, "utf8"));
 const meeting = data.meetings.find((item) => item.id === meetingId);
 if (!meeting) {
   throw new Error(`Meeting ${meetingId} was not found.`);

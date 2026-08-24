@@ -139,7 +139,12 @@ scoped to the signed-in account.
 
 - Passwords are hashed with scrypt; sessions are HttpOnly `SameSite=Lax` cookies
   (only the token hash is stored server-side). Login and signup are rate limited
-  per IP and per account.
+  per IP and per account. Only *failed* logins count against the per-account
+  budget, so signing in often costs nothing — but eight wrong guesses do lock that
+  one account for the rest of a 15-minute window, its owner included. That is
+  deliberate: the budget is checked before the password is verified, because
+  verifying costs ~100ms of scrypt and doing that for every attempt is its own
+  denial of service.
 - The first account becomes the admin. Admins invite teammates from the **Team**
   panel (single-use links, 7-day expiry) and can set `AUTH_ALLOW_SIGNUPS=false`
   to make the instance invite-only.
@@ -190,20 +195,36 @@ before exposing an instance to real teams you should also know:
 
 - Rate-limit counters are in-process; move them to Redis before running more
   than one web replica.
-- Per-meeting retention days are recorded but automatic deletion is **not
-  implemented yet** — transcripts stay until you delete them.
+- Per-meeting retention is enforced: an hourly sweep purges the raw and normalized
+  transcripts once they are older than the meeting's `retentionDays`, keeping the
+  meeting record and its generated notes. The clock starts when the transcript was
+  captured, not when the meeting was created.
+- **Behind a reverse proxy, set `TRUST_PROXY_HOPS`** to the number of proxies you
+  control (`1` for a single Caddy or nginx in front). Leave it at `0` and every
+  request appears to come from the proxy, so all users share one rate-limit bucket
+  and per-IP limits stop meaning anything. Set it higher than the real hop count and
+  clients can forge the address the limiter keys on — so count the hops, don't guess.
 - Google OAuth tokens are stored per user under `data/google-tokens/`; mount
   `data/` on encrypted storage.
 - Transcripts pass through Deepgram and your chosen LLM vendor; make sure that
   fits your data-processing requirements.
+- Anyone with an account on the instance who creates a meeting with the same Meet
+  link and start time as an in-flight recording will *follow* that recording and
+  receive a copy of its notes and transcript (see "Accounts and team"). That is the
+  intended de-duplication behaviour, not a per-meeting access control — an instance
+  is a trust boundary, so give accounts only to people allowed to see every meeting
+  recorded on it.
 
 ## Development
 
 ```bash
 npm test        # unit tests (node --test, no framework)
-npm run check   # syntax-check every module
+npm run check   # syntax-check every module under src/ and scripts/
 npm run hooks   # enable the pre-commit secret-scanning hook (uses gitleaks if installed)
 ```
+
+CI runs `npm run check` and `npm test` on Node 22 and 24, and builds the Docker
+image, for every pull request.
 
 `BOT_PROVIDER=demo` (the default) exercises the whole pipeline deterministically,
 so most changes can be developed and tested without any API keys.

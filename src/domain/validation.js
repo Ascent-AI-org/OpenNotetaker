@@ -1,4 +1,5 @@
 const MEET_HOSTS = new Set(["meet.google.com"]);
+const MEET_SCHEMES = new Set(["https:", "http:"]);
 
 export function validateMeetingInput(input) {
   const errors = {};
@@ -47,6 +48,10 @@ export function validateMeetingInput(input) {
 export function isGoogleMeetUrl(value) {
   try {
     const url = new URL(value);
+    // Pin the scheme: the hostname check alone accepts anything the URL parser will
+    // take, and this value is later handed to a browser to navigate to and rendered
+    // as an href in the dashboard.
+    if (!MEET_SCHEMES.has(url.protocol)) return false;
     if (!MEET_HOSTS.has(url.hostname)) return false;
     return /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(url.pathname);
   } catch {
