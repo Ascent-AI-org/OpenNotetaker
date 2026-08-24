@@ -154,6 +154,13 @@ export function readConfig({ rootDir = defaultRootDir() } = {}) {
       }
     },
     email: {
+      actionItems: {
+        // How long an automatic action-item email is held after the notes are ready.
+        // The list is editable because extraction gets things wrong, and mail already
+        // delivered cannot be corrected — this is the window to fix or cancel it. Set to
+        // 0 to send on the next sweep.
+        holdMinutes: parseNonNegativeInt(process.env.ACTION_ITEMS_HOLD_MINUTES, 10)
+      },
       transcript: {
         enabled: parseBoolean(process.env.TRANSCRIPT_EMAIL_ENABLED, false),
         recipient: transcriptRecipients[0] || "",
