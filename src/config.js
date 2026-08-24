@@ -1,5 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// The package root, i.e. the directory holding package.json — not the process working
+// directory, which is whatever the operator happened to launch from.
+function defaultRootDir() {
+  return resolve(fileURLToPath(new URL("..", import.meta.url)));
+}
 
 const loadedEnv = new Set();
 
@@ -29,7 +36,7 @@ export function loadDotEnv(cwd = process.cwd()) {
   }
 }
 
-export function readConfig() {
+export function readConfig({ rootDir = defaultRootDir() } = {}) {
   loadDotEnv();
 
   const port = Number.parseInt(process.env.PORT || "5173", 10);
@@ -42,11 +49,30 @@ export function readConfig() {
   const transcriptRecipients = sanitizeEmailList(process.env.TRANSCRIPT_EMAIL_TO || "");
   const transcriptSender = sanitizeEmail(process.env.TRANSCRIPT_EMAIL_FROM || transcriptRecipients[0] || "");
 
+  // Everything the app persists — the meeting store, the user store, and per-user Google
+  // OAuth tokens — lives under one directory. It used to be split: meetings.json and
+  // users.json resolved against the package root while token files resolved against the
+  // process working directory, so running from anywhere else quietly wrote them to two
+  // places. Under `npm run dev` and in the container those are the same path, so the
+  // default below is unchanged for every documented way of running this.
+  const dataDir = process.env.DATA_DIR ? resolve(process.env.DATA_DIR) : resolve(rootDir, "data");
+
   return {
-    rootDir: process.cwd(),
+    rootDir,
+    storage: {
+      dataDir,
+      meetingsPath: resolve(dataDir, "meetings.json"),
+      usersPath: resolve(dataDir, "users.json")
+    },
     server: {
       host,
-      port
+      port,
+      // Number of trusted reverse proxies in front of this server. 0 (the default)
+      // means "no proxy": the socket address is the client. Set it to the real hop
+      // count only when every one of those hops is a proxy you control and that
+      // rewrites X-Forwarded-For — a wrong value lets clients forge their own IP and
+      // sidestep every rate limit. See clientIp() in src/server.js.
+      trustProxyHops: parseNonNegativeInt(process.env.TRUST_PROXY_HOPS, 0)
     },
     auth: {
       allowSignups: parseBoolean(process.env.AUTH_ALLOW_SIGNUPS, true),
@@ -63,11 +89,13 @@ export function readConfig() {
       // Fleet mode: how long a worker's claim stays valid without a renewing API call,
       // and how often the server sweeps for expired leases.
       leaseSeconds: parsePositiveInt(process.env.RUNNER_LEASE_SECONDS, 120),
-      scriptPath: process.env.BOT_RUNNER_SCRIPT || resolve(process.cwd(), "src", "bot-runner", "runner.js"),
+      // Resolved against the package root, matching the cwd the runner is spawned with
+      // (see startExternalBotJob); process.cwd() would break whenever they differ.
+      scriptPath: process.env.BOT_RUNNER_SCRIPT || resolve(rootDir, "src", "bot-runner", "runner.js"),
       displayName: process.env.BOT_DISPLAY_NAME || "OpenNotetaker - Recording",
       chromeChannel: process.env.BOT_CHROME_CHANNEL || "chrome",
       chromeExecutablePath: process.env.BOT_CHROME_EXECUTABLE_PATH || "",
-      chromeUserDataDir: process.env.BOT_CHROME_USER_DATA_DIR || resolve(process.cwd(), ".bot-profile"),
+      chromeUserDataDir: process.env.BOT_CHROME_USER_DATA_DIR || resolve(rootDir, ".bot-profile"),
       chromeLaunchMode: process.env.BOT_CHROME_LAUNCH_MODE || "rawcdp",
       chromeExtraArgs: splitArgs(process.env.BOT_CHROME_EXTRA_ARGS || ""),
       headless: parseBoolean(process.env.BOT_HEADLESS, false),
@@ -107,9 +135,13 @@ export function readConfig() {
       clientId: process.env.GOOGLE_CLIENT_ID || "",
       clientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
       redirectUri: process.env.GOOGLE_REDIRECT_URI || `${baseUrl}/api/gmail/oauth/callback`,
-      gmailTokenPath: resolve(process.cwd(), process.env.GOOGLE_GMAIL_TOKEN_PATH || "data/google-gmail-token.json"),
+      gmailTokenPath: process.env.GOOGLE_GMAIL_TOKEN_PATH
+        ? resolve(process.env.GOOGLE_GMAIL_TOKEN_PATH)
+        : resolve(dataDir, "google-gmail-token.json"),
       // Multi-user: one Google OAuth token file per user lives in this directory.
-      tokenDir: resolve(process.cwd(), process.env.GOOGLE_TOKEN_DIR || "data/google-tokens"),
+      tokenDir: process.env.GOOGLE_TOKEN_DIR
+        ? resolve(process.env.GOOGLE_TOKEN_DIR)
+        : resolve(dataDir, "google-tokens"),
       calendar: {
         enabled: parseBoolean(process.env.GOOGLE_CALENDAR_SYNC_ENABLED, false),
         autoStart: parseBoolean(process.env.GOOGLE_CALENDAR_AUTOSTART_ENABLED, false),
