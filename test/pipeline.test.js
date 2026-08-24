@@ -178,6 +178,9 @@ test("pruneExpiredArtifacts clears transcripts past retention but keeps notes, a
   });
   await store.updateMeeting(expired.id, {
     createdAt: daysAgo(31),
+    // Retention runs from when the transcript was captured, not when the meeting record
+    // was created — the two differ whenever a job sits scheduled before it records.
+    transcriptCapturedAt: daysAgo(31),
     status: "completed",
     artifacts: { rawSegments: someSegments, normalizedSegments: someSegments, notes: "Keep this summary." }
   });
@@ -191,6 +194,7 @@ test("pruneExpiredArtifacts clears transcripts past retention but keeps notes, a
   });
   await store.updateMeeting(withinWindow.id, {
     createdAt: daysAgo(5),
+    transcriptCapturedAt: daysAgo(5),
     status: "completed",
     artifacts: { rawSegments: someSegments, normalizedSegments: someSegments, notes: "Recent." }
   });
@@ -204,6 +208,7 @@ test("pruneExpiredArtifacts clears transcripts past retention but keeps notes, a
   });
   await store.updateMeeting(stillRecording.id, {
     createdAt: daysAgo(60),
+    transcriptCapturedAt: daysAgo(60),
     status: "recording",
     artifacts: { rawSegments: someSegments, normalizedSegments: someSegments, notes: null }
   });
