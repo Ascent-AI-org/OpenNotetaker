@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The default token needs nothing beyond reading the checked-out code.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Node 22 is the floor declared in package.json engines; 24 catches breakage on the
+    # version contributors are most likely to actually have installed.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check every module
+        run: npm run check
+
+      - name: Unit tests
+        run: npm test
+
+  docker:
+    # The published quickstart is `docker compose up`, so a Dockerfile that no longer
+    # builds is a broken front door. Build only — running it needs real API keys.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t open-notetaker:ci .
