@@ -112,9 +112,15 @@ only npm dependency is `playwright-core`.
 
 ## Google setup (optional)
 
-Connecting Google enables per-user transcript email (sent from the user's own
-Gmail), calendar import with automatic bot joining, and "Sign in with Google".
-Skip it entirely and OpenNotetaker still records and takes notes.
+Connecting Google enables transcript email (sent from your own Gmail), calendar
+import with automatic bot joining, and "Sign in with Google". Skip it entirely and
+OpenNotetaker still records and takes notes.
+
+You can connect **several Google accounts to one OpenNotetaker login** — a work
+address and a personal one, or two addresses on the same team. Every connected
+calendar is imported into the same meeting list, each connection has its own
+switches, and notes are delivered to all of them. See "Multiple Google accounts"
+below.
 
 1. In [Google Cloud Console](https://console.cloud.google.com), create a project
    and enable the **Gmail API** and **Google Calendar API**.
@@ -127,16 +133,75 @@ Skip it entirely and OpenNotetaker still records and takes notes.
 4. Put the client ID and secret in `.env` (`GOOGLE_CLIENT_ID`,
    `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`).
 
-Scopes requested: `gmail.send` and `calendar.readonly`. Calendar sync is
-read-only — it imports upcoming events that have Google Meet links from each
-user's primary calendar and, when the user enables autostart, queues the bot
-about 2 minutes before the meeting begins.
+Scopes requested: `openid`, `email`, `profile`, `gmail.send`, and
+`calendar.readonly`. The identity scopes are what let one login hold several
+connections — without them a second grant is indistinguishable from the first, so
+it could not be labelled or reconnected independently. Calendar sync is read-only:
+it imports upcoming events that have Google Meet links, and when autostart is on
+for that connection, queues the bot about 2 minutes before the meeting begins.
+
+## Multiple Google accounts
+
+Press **Connect another** in Settings for each account you want to add (up to 10).
+Each connection appears as its own row with three switches:
+
+| Switch | What it does |
+|---|---|
+| **Import calendar** | Poll this account's calendar and create meetings from events with a Meet link. |
+| **Auto-join** | Send the bot automatically, ~2 minutes before those meetings start. |
+| **Receives notes** | Deliver finished notes to this account's own inbox. |
+
+One row is marked **sends by default** — that is the mailbox outgoing notes are
+sent from. A meeting imported from a specific calendar sends from that calendar's
+account instead, so replies land in the right inbox.
+
+Meetings from every connected account appear in one list rather than behind an
+account switcher: an event on two connected calendars is imported once and
+recorded once, and both accounts receive the notes. **Disconnect** deletes the
+stored credential, not just the row.
+
+Upgrading from a single-account install needs nothing — the existing connection is
+migrated to the new layout on first boot, keeping its calendar settings. Its
+address shows as unconfirmed until Google confirms it, which happens on the next
+sync or reconnect.
+
+## Action items
+
+Extracted action items are LLM output, so some of them are wrong — an invented
+task, a guessed owner, a deadline read out of a throwaway sentence. Since these
+are also the part of a meeting you might send to other people, they are editable
+and their delivery is deliberate.
+
+**Editing.** Press **Edit** on a finished meeting to fix wording, reassign an
+owner, correct a date, delete an item, or add one the extraction missed. Edits
+flow into the export, the email, and the dashboard, and are recorded in the run
+log.
+
+**Who receives them.** Only addresses you list. Calendar attendees are *never*
+mailed automatically, even though they are on the invite and OpenNotetaker stores
+them — a meeting with a client, a candidate, or a vendor on it would otherwise
+send them your internal notes because nobody decided to. Instead, attendees appear
+under the action items as one-click chips, with anyone outside your connected
+domains marked ⚠, and sending to an outside address asks for confirmation. Adding
+everyone is still one click each; it is just a click someone makes.
+
+**When they go out.** Off by default. Turn on "Send action items automatically" in
+Settings and each finished meeting queues an email held for
+`ACTION_ITEMS_HOLD_MINUTES` (default 10) — the window to fix or cancel before it
+leaves. **Don't send** cancels this meeting's send; **Send now** skips the wait.
+Set the hold to `0` to send as soon as notes are ready. The schedule lives on the
+meeting rather than in a timer, so a restart mid-hold still delivers.
 
 ## Accounts and team
 
 OpenNotetaker is multi-user; every meeting, transcript, and Google connection is
 scoped to the signed-in account.
 
+- Action items are only ever emailed to addresses someone put on the list;
+  calendar attendees are suggestions, never automatic recipients. Addresses
+  outside your connected domains are flagged in the UI and confirmed before send.
+- Disconnecting a Google account deletes its stored refresh token from disk rather
+  than only removing it from the account list.
 - Passwords are hashed with scrypt; sessions are HttpOnly `SameSite=Lax` cookies
   (only the token hash is stored server-side). Login and signup are rate limited
   per IP and per account. Only *failed* logins count against the per-account
