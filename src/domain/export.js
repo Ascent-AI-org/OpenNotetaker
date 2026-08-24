@@ -256,7 +256,7 @@ function renderMarkdownSection(section, meeting, notes) {
     case "risks":
       return renderList(notes.risks);
     case "participants":
-      return renderList(meeting?.artifacts?.participants);
+      return renderList((meeting?.artifacts?.participants || []).map(participantName).filter(Boolean));
     case "roleTranscript":
       return renderRoleTranscript(meeting?.artifacts?.reconstructedTranscript);
     case "cleanTranscript":
@@ -276,6 +276,12 @@ function renderMarkdownSection(section, meeting, notes) {
     default:
       return "None.";
   }
+}
+
+// The runner stores each participant as {name, firstSeenAt, lastSeenAt}; older records
+// and the demo pipeline store a bare string. Both have to render as a name.
+function participantName(participant) {
+  return typeof participant === "string" ? participant : String(participant?.name || "").trim();
 }
 
 function renderList(items) {
