@@ -98,6 +98,13 @@
           <label for="meetUrl">Google Meet link</label>
           <input id="meetUrl" name="meetUrl" placeholder="https://meet.google.com/xxx-xxxx-xxx" required />
         </div>
+        <div class="field" id="record-video-field" hidden>
+          <label class="switch-line">
+            <input type="checkbox" id="record-video" checked />
+            <span>Record video</span>
+          </label>
+          <p class="field-hint" id="record-video-hint"></p>
+        </div>
         <details class="form-advanced">
           <summary>Scheduling &amp; consent</summary>
           <div class="form-advanced-body">
@@ -126,6 +133,35 @@
         <footer class="dialog-actions">
           <button type="button" class="btn btn-ghost" data-close-dialog>Cancel</button>
           <button id="create-button" class="btn btn-primary" type="submit">Create meeting</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="clip-dialog" class="dialog">
+      <form id="clip-form" method="dialog" novalidate>
+        <header class="dialog-head">
+          <h2>Clip this moment</h2>
+          <p>Cuts a short piece out of the recording. It stays internal until you make a link for it.</p>
+        </header>
+        <div class="field">
+          <label for="clip-label">Label</label>
+          <input id="clip-label" maxlength="120" placeholder="Pricing agreed" />
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label for="clip-start">Start</label>
+            <input id="clip-start" inputmode="text" placeholder="mm:ss" />
+          </div>
+          <div class="field">
+            <label for="clip-end">End</label>
+            <input id="clip-end" inputmode="text" placeholder="mm:ss" />
+          </div>
+        </div>
+        <p id="clip-length" class="field-hint" role="status"></p>
+        <p id="clip-error" class="form-error" role="alert"></p>
+        <footer class="dialog-actions">
+          <button type="button" class="btn btn-ghost" data-close-dialog>Cancel</button>
+          <button id="clip-create" class="btn btn-primary" type="submit">Create clip</button>
         </footer>
       </form>
     </dialog>

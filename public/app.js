@@ -17,6 +17,18 @@ const state = {
   sendingEmails: new Set(),
   syncingCalendar: false,
   openFolds: new Set(["transcript"]),
+  // Operator flags from the server. null until the first answer lands; every video
+  // affordance stays hidden until then, so a slow or missing endpoint fails closed.
+  features: null,
+  openClips: new Set(),
+  // Raw share URLs live here and nowhere else. The server stores only the sha256 of a
+  // share token and hands the URL back exactly once, so this Map is the single copy in
+  // existence — a reload loses it, which is the property being bought.
+  revealedShares: new Map(),
+  // Per-clip expiry choice, held across the 1.8s poll re-render so a picked "30 days"
+  // is not silently reset to the default between choosing it and clicking create.
+  shareExpiry: new Map(),
+  clipDraft: null,
   export: null // initialised below, once EXPORT_SECTIONS exists
 };
 
@@ -51,6 +63,19 @@ state.export = {
   busy: false,
   error: ""
 };
+
+// What the UI assumes when the server has not said otherwise. `enabled: false` is the
+// load-bearing part: an install with VIDEO_RECORDING_ENABLED off, an older server with
+// no features route at all, and a failed request must all produce the same UI — none.
+const NO_VIDEO_FEATURE = {
+  enabled: false,
+  recordByDefault: true,
+  retentionDays: 7,
+  maxClipSeconds: 300,
+  shareDefaultDays: 7
+};
+
+const SHARE_EXPIRY_CHOICES = [1, 7, 30];
 
 const STATUS_META = {
   scheduled: { label: "Scheduled", tone: "muted" },
@@ -116,6 +141,18 @@ const createDialog = $("#create-dialog");
 const meetingForm = $("#meeting-form");
 const formError = $("#form-error");
 const createButton = $("#create-button");
+const recordVideoField = $("#record-video-field");
+const recordVideoInput = $("#record-video");
+const recordVideoHint = $("#record-video-hint");
+
+const clipDialog = $("#clip-dialog");
+const clipForm = $("#clip-form");
+const clipLabelInput = $("#clip-label");
+const clipStartInput = $("#clip-start");
+const clipEndInput = $("#clip-end");
+const clipLengthHint = $("#clip-length");
+const clipError = $("#clip-error");
+const clipCreateButton = $("#clip-create");
 
 const settingsDialog = $("#settings-dialog");
 const gmailStatusText = $("#gmail-status-text");
@@ -197,9 +234,17 @@ inviteCopy.addEventListener("click", async () => {
 });
 teamList.addEventListener("click", handleTeamAction);
 
+clipForm.addEventListener("submit", handleCreateClip);
+clipStartInput.addEventListener("input", renderClipLengthHint);
+clipEndInput.addEventListener("input", renderClipLengthHint);
+
 // Export popover: delegated, because the app bar it lives in is rebuilt on every render.
 detail.addEventListener("click", handleExportClick);
 detail.addEventListener("change", handleExportChange);
+// Video, seek, clips and share controls: same reason, plus a finished meeting can carry
+// hundreds of transcript rows that each want a play affordance.
+detail.addEventListener("click", handleVideoClick);
+detail.addEventListener("change", handleVideoChange);
 document.addEventListener("click", (event) => {
   if (!state.export.open) return;
   if (event.target.closest("[data-export-root]")) return;
@@ -240,6 +285,10 @@ document.addEventListener("keydown", (event) => {
 function selectMeeting(id) {
   state.selectedId = id;
   state.view = "detail";
+  // A freshly minted share URL is shown in the moment it was made and not kept around
+  // afterwards. Leaving it to reappear on every visit would make "shown exactly once"
+  // a claim the UI itself contradicts.
+  state.revealedShares.clear();
   renderCache.list = "";
   renderCache.detail = "";
   updateViewNav();
@@ -316,8 +365,8 @@ async function boot() {
     return;
   }
   try {
-    const { user } = await api("/api/auth/me");
-    enterApp(user);
+    const session = await api("/api/auth/me");
+    enterApp(session.user, session.features);
   } catch {
     showAuthGate();
   }
@@ -417,7 +466,7 @@ async function handleTeamAction(event) {
   }
 }
 
-function enterApp(user) {
+function enterApp(user, features) {
   state.user = user;
   authGate.hidden = true;
   appShell.hidden = false;
@@ -425,13 +474,45 @@ function enterApp(user) {
   renderUserChip();
   fillSettingsForm();
   renderList();
+  void loadFeatures(features);
   if (!state.pollTimer) state.pollTimer = setInterval(refresh, 1800);
   void refresh();
+}
+
+// The auth response is allowed to carry the flags, which saves a round trip and gets the
+// first paint right; anything else asks the dedicated route. Either way a failure means
+// "no video", never "assume yes and 404 on click".
+async function loadFeatures(seed) {
+  if (!seed) {
+    try {
+      const payload = await api("/api/features");
+      seed = payload.features || payload;
+    } catch {
+      seed = null;
+    }
+  }
+  state.features = { video: { ...NO_VIDEO_FEATURE, ...(seed?.video || {}) } };
+  // Held back until there is something to draw: repainting an empty pane here would
+  // flash "Nothing selected" over the boot skeletons.
+  if (state.meetings) {
+    renderCache.detail = "";
+    renderMain();
+  }
+}
+
+function videoFeature() {
+  return state.features?.video || NO_VIDEO_FEATURE;
 }
 
 function showAuthGate() {
   state.user = null;
   state.meetings = null;
+  state.features = null;
+  // A share URL is only ever shown to the person who minted it, in the session that
+  // minted it. Signing out must not leave one sitting in memory for the next account
+  // that signs in on this machine.
+  state.revealedShares.clear();
+  state.openClips.clear();
   renderCache.list = "";
   renderCache.detail = "";
   if (state.pollTimer) {
@@ -508,9 +589,9 @@ async function handleAuthSubmit(event) {
     const path = state.authMode === "signup" ? "/api/auth/signup" : "/api/auth/login";
     const payload = { email: authEmail.value, password: authPassword.value };
     if (state.authMode === "signup") payload.name = authName.value;
-    const { user } = await api(path, { method: "POST", body: JSON.stringify(payload) });
+    const session = await api(path, { method: "POST", body: JSON.stringify(payload) });
     authPassword.value = "";
-    enterApp(user);
+    enterApp(session.user, session.features);
   } catch (error) {
     authError.textContent = error.message;
   } finally {
@@ -1060,7 +1141,13 @@ function renderDetail() {
         canEmailTranscript(meeting),
         [...state.openFolds],
         state.editingActionItems,
-        state.editingActionItems === meeting.id ? state.actionItemDrafts.get(meeting.id) : null
+        state.editingActionItems === meeting.id ? state.actionItemDrafts.get(meeting.id) : null,
+        videoFeature().enabled,
+        [...state.openClips],
+        // Keys only. A share URL is a bearer credential; it has no business being
+        // stringified into a cache key that lives on in memory.
+        [...state.revealedShares.keys()],
+        [...state.shareExpiry]
       ])
     : "empty";
   if (cacheKey === renderCache.detail) return;
@@ -1069,6 +1156,10 @@ function renderDetail() {
   // are held off until the edit is saved or cancelled. Deliberate redraws clear
   // renderCache.detail first and still get through.
   if (meeting && state.editingActionItems === meeting.id && renderCache.detail !== "") return;
+  // Same bargain for playback. Rebuilding the pane swaps the <video> element out from
+  // under whoever is watching, so a poll tick that would interrupt a playing recording
+  // is dropped instead. Deliberate redraws still get through and put the playhead back.
+  if (meeting && isWatchingVideo() && renderCache.detail !== "") return;
   renderCache.detail = cacheKey;
 
   if (!meeting) {
@@ -1083,6 +1174,7 @@ function renderDetail() {
       </div>
     `;
     detail.querySelector("[data-open-create]")?.addEventListener("click", openCreateDialog);
+    indexSeekGroups();
     return;
   }
 
@@ -1092,6 +1184,7 @@ function renderDetail() {
   const notes = meeting.artifacts?.notes;
   // Scheme-guarded: escaping alone would still let a stored javascript: URL run on click.
   const meetHref = safeMeetHref(meeting.meetUrl);
+  const playhead = capturePlayhead();
 
   detail.innerHTML = `
     ${renderAppBar({
@@ -1125,11 +1218,14 @@ function renderDetail() {
       </header>
 
       ${renderStatusBanner(meeting)}
+      ${renderVideo(meeting)}
       ${notes ? renderNotes(notes, meeting) : ""}
       ${renderTranscript(meeting)}
       ${renderRunLog(meeting.events)}
     </div>
   `;
+
+  wireVideoPlayer(playhead);
 
   detail.querySelector("#start-button")?.addEventListener("click", async () => {
     state.runningStarts.add(meeting.id);
@@ -1485,7 +1581,7 @@ function renderNotes(notes, meeting) {
                             <td class="cell-task">${escapeHtml(item.task)}</td>
                             <td><span class="owner-chip${isKnownOwner(item.owner) ? " known" : ""}">${escapeHtml(item.owner || "Unknown")}</span></td>
                             <td>${escapeHtml(item.due || "Not stated")}</td>
-                            <td class="cell-num">${escapeHtml(item.evidenceTimestamp || "")}</td>
+                            <td class="cell-num">${renderEvidenceControls(meeting, item)}</td>
                           </tr>
                         `
                       )
@@ -1566,13 +1662,15 @@ function renderTranscript(meeting) {
     ? `<div class="transcript-warning">${reconstructed.warnings.map(escapeHtml).join(" · ")}</div>`
     : "";
 
+  const playable = videoPlayable(meeting);
+
   const turnRows = turns
     .map(
       (turn) => `
-        <div class="turn">
+        <div class="turn"${playable ? ` data-line-start="${Number(turn.start) || 0}"` : ""}>
           <div class="turn-meta">
             <span class="turn-speaker">${escapeHtml(turn.role)}</span>
-            <span class="turn-time">${formatTime(turn.start)}</span>
+            ${renderSeekTime(turn.start, playable)}
             ${turn.flags?.length ? `<span class="turn-flag">${escapeHtml(turn.flags.join(", "))}</span>` : ""}
           </div>
           <p class="turn-text">${escapeHtml(turn.text)}</p>
@@ -1586,10 +1684,10 @@ function renderTranscript(meeting) {
     .map((segment) => {
       const normalized = normalizedById.get(segment.id);
       return `
-        <div class="compare-row">
+        <div class="compare-row"${playable ? ` data-line-start="${Number(segment.start) || 0}"` : ""}>
           <div class="turn-meta">
             <span class="turn-speaker">${escapeHtml(segment.speaker)}</span>
-            <span class="turn-time">${formatTime(segment.start)}</span>
+            ${renderSeekTime(segment.start, playable)}
           </div>
           <p class="compare-raw"><span class="copy-label">Raw Hinglish</span>${escapeHtml(segment.text)}</p>
           <p><span class="copy-label">Clean English</span>${escapeHtml(normalized?.english || "Waiting for normalization.")}</p>
@@ -1598,15 +1696,18 @@ function renderTranscript(meeting) {
     })
     .join("");
 
+  // Each list is its own seek group: the two folds cover the same timeline, so one
+  // flat index of rows would not be sorted and the "which row is playing" lookup
+  // would land on whichever list happened to come second in the DOM.
   const transcriptBody = turns.length
-    ? `${roleLegend ? `<div class="role-legend">${roleLegend}</div>` : ""}${warnings}<div class="turn-list">${turnRows}</div>`
-    : `<div class="turn-list">${compareRows}</div>`;
+    ? `${roleLegend ? `<div class="role-legend">${roleLegend}</div>` : ""}${warnings}<div class="turn-list" data-seek-group>${turnRows}</div>`
+    : `<div class="turn-list" data-seek-group>${compareRows}</div>`;
 
   return `
     ${renderFold("transcript", "Transcript", turns.length ? `${turns.length} turns` : `${rawSegments.length} segments`, transcriptBody)}
     ${
       turns.length && rawSegments.length
-        ? renderFold("raw-evidence", "Raw Hinglish evidence", `${rawSegments.length} segments`, `<div class="turn-list">${compareRows}</div>`)
+        ? renderFold("raw-evidence", "Raw Hinglish evidence", `${rawSegments.length} segments`, `<div class="turn-list" data-seek-group>${compareRows}</div>`)
         : ""
     }
   `;
@@ -1627,6 +1728,679 @@ function renderRunLog(events) {
     )
     .join("");
   return renderFold("run-log", "Run log", String(events.length), `<ol class="event-list">${rows}</ol>`);
+}
+
+/* ---------- Recording, seek sync, clips ---------- */
+
+const CLIP_LEAD_SECONDS = 8;
+const CLIP_TAIL_SECONDS = 4;
+
+function videoPlayable(meeting) {
+  return meeting?.video?.status === "ready";
+}
+
+function renderVideo(meeting) {
+  const video = meeting.video;
+  // Meetings that predate the feature carry no video block at all, and nothing in their
+  // UI should suggest a recording was ever an option for them.
+  if (!video) return "";
+
+  const clips = meeting.clips || [];
+  const ready = video.status === "ready";
+  const source = `/api/meetings/${encodeURIComponent(meeting.id)}/video`;
+  const toggle = canToggleRecording(meeting)
+    ? `<button class="btn btn-secondary btn-sm" type="button" data-video-toggle="${video.enabled ? "off" : "on"}">${
+        video.enabled ? "Don't record video" : "Record video"
+      }</button>`
+    : "";
+
+  return `
+    <section class="doc-section">
+      <div class="sec-label-row">
+        <div class="sec-label">
+          Recording
+          ${ready && video.durationMs ? `<span class="sec-count">${escapeHtml(formatTimecode(video.durationMs))}</span>` : ""}
+        </div>
+        ${
+          ready
+            ? `<div class="sec-actions">
+                 <span class="video-meta">${escapeHtml(videoMetaText(video))}</span>
+                 <button class="btn btn-secondary btn-sm" type="button" data-clip-here>Clip this moment</button>
+               </div>`
+            : toggle && `<div class="sec-actions">${toggle}</div>`
+        }
+      </div>
+      ${
+        ready
+          ? `<video class="video-player" data-video-player="${escapeHtml(meeting.id)}"
+                    src="${escapeHtml(source)}" controls playsinline preload="metadata"></video>`
+          : renderVideoStatus(meeting, video)
+      }
+      ${ready || clips.length ? renderClips(meeting, clips) : ""}
+    </section>
+  `;
+}
+
+// Video is additive; the transcript is the product. So every state that is not "here is
+// your recording" says plainly what happened instead of leaving a blank space that reads
+// like the whole meeting failed.
+function renderVideoStatus(meeting, video) {
+  if (video.status === "recording") return videoStatusChip("live", "Recording…");
+  if (video.status === "processing") return videoStatusChip("warn", "Processing…");
+  if (video.status === "pending") return videoStatusChip("muted", "Video queued — capture starts when the bot joins.");
+  if (video.status === "skipped") return videoStatusChip("muted", "Not recorded.");
+  if (video.status === "failed") {
+    return videoStatusChip("bad", `Video unavailable — ${video.error || "the capture failed"}`);
+  }
+  if (video.status === "purged") {
+    const days = effectiveVideoRetentionDays(meeting);
+    return videoStatusChip("muted", days ? `Purged after ${days} day${days === 1 ? "" : "s"}.` : "Purged.");
+  }
+  return videoStatusChip("muted", "No recording.");
+}
+
+// The opt-out has to exist wherever the meeting came from. A calendar import never passed
+// through the create dialog's checkbox, so on an install with sync on this is the only
+// place its owner is ever asked — and the artifact is video of everyone's face. Only while
+// the meeting is still scheduled: after that the block is a record of what was captured.
+function canToggleRecording(meeting) {
+  return (
+    videoFeature().enabled &&
+    meeting.status === "scheduled" &&
+    ["pending", "skipped"].includes(meeting.video?.status)
+  );
+}
+
+function videoStatusChip(tone, text) {
+  return `<p class="video-status is-${tone}">${escapeHtml(text)}</p>`;
+}
+
+// Video never outlives the transcript: the operator's ceiling and this meeting's own
+// retention both apply, and the shorter one is the one that happened.
+function effectiveVideoRetentionDays(meeting) {
+  const days = [videoFeature().retentionDays, meeting.retentionDays]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return days.length ? Math.min(...days) : 0;
+}
+
+function videoMetaText(video) {
+  return [video.width && video.height ? `${video.width}×${video.height}` : "", video.bytes ? formatBytes(video.bytes) : ""]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+// The timestamp itself is the play control. A separate icon button beside it would double
+// the hit targets in a transcript that routinely runs to a couple of thousand rows, to
+// put the affordance somewhere nobody would look for it.
+function renderSeekTime(seconds, playable) {
+  const label = formatTime(seconds);
+  if (!playable) return `<span class="turn-time">${label}</span>`;
+  return `
+    <button type="button" class="turn-time seek-btn" data-seek="${Number(seconds) || 0}"
+            aria-label="Play the recording from ${label}">
+      <svg class="seek-glyph" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.6 1.4 L8.2 5 L2.6 8.6 Z" fill="currentColor"/></svg>${label}
+    </button>`;
+}
+
+function renderEvidenceControls(meeting, item) {
+  const stamp = item.evidenceTimestamp || "";
+  if (!videoPlayable(meeting)) return escapeHtml(stamp);
+  const moment = evidenceMoment(meeting, item);
+  if (!moment) return escapeHtml(stamp);
+  return `
+    <div class="evidence-actions">
+      ${renderSeekTime(moment.start, true)}
+      <button type="button" class="btn btn-ghost btn-sm" data-clip-open
+              data-clip-start="${moment.start}" data-clip-end="${moment.end}"
+              data-clip-source="${escapeHtml(moment.id || "")}"
+              data-clip-label="${escapeHtml(item.task || "")}"
+              aria-label="Clip the recording around ${escapeHtml(formatTime(moment.start))}">Clip</button>
+    </div>`;
+}
+
+// Evidence arrives two ways: ids of the transcript rows where the commitment was made,
+// and a "mm:ss" string. The ids win — they survive somebody retyping the timestamp by
+// hand while editing the item, and they carry an end time, which a string never does.
+function evidenceMoment(meeting, item) {
+  for (const id of item.evidenceSegmentIds || []) {
+    const row = findTranscriptRow(meeting, id);
+    if (row) return { start: Number(row.start) || 0, end: Number(row.end ?? row.start) || 0, id };
+  }
+  const parsed = parseClockInput(item.evidenceTimestamp);
+  if (parsed === null) return null;
+  return { start: parsed / 1000, end: parsed / 1000, id: null };
+}
+
+function findTranscriptRow(meeting, id) {
+  const artifacts = meeting.artifacts || {};
+  for (const pool of [artifacts.reconstructedTranscript?.turns, artifacts.rawSegments, artifacts.normalizedSegments]) {
+    const hit = (pool || []).find((row) => row.id === id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function renderClips(meeting, clips) {
+  return `
+    <div class="clip-block">
+      <p class="clip-block-label">Clips <span class="sec-count">${clips.length}</span></p>
+      ${
+        clips.length
+          ? `<div class="clip-list">${clips.map((clip) => renderClip(meeting, clip)).join("")}</div>`
+          : `<p class="muted-note">No clips yet. Cut one from an action item above, or from wherever the player is sitting.</p>`
+      }
+    </div>`;
+}
+
+function renderClip(meeting, clip) {
+  const open = state.openClips.has(clip.id);
+  const source = `/api/meetings/${encodeURIComponent(meeting.id)}/clips/${encodeURIComponent(clip.id)}`;
+  const lengthMs = Math.max(0, (Number(clip.endMs) || 0) - (Number(clip.startMs) || 0));
+  const meta = [
+    `${formatTimecode(clip.startMs)} – ${formatTimecode(clip.endMs)}`,
+    lengthMs ? `${(lengthMs / 1000).toFixed(1)}s` : "",
+    clip.bytes ? formatBytes(clip.bytes) : ""
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return `
+    <article class="clip-row" data-clip-id="${escapeHtml(clip.id)}">
+      <div class="clip-head">
+        <div class="clip-main">
+          <span class="clip-label">${escapeHtml(clip.label)}</span>
+          <span class="clip-meta">${escapeHtml(meta)}</span>
+        </div>
+        <div class="clip-actions">
+          <button type="button" class="btn btn-ghost btn-sm" data-clip-toggle aria-expanded="${open ? "true" : "false"}">
+            ${open ? "Hide" : "Play"}
+          </button>
+          ${shareActive(clip.share) ? "" : renderShareControl(clip)}
+          <button type="button" class="btn btn-ghost btn-sm clip-destructive" data-clip-delete>Delete</button>
+        </div>
+      </div>
+      ${
+        open
+          ? `<video class="clip-player" data-clip-player src="${escapeHtml(source)}" controls playsinline preload="metadata"></video>`
+          : ""
+      }
+      ${renderShareBox(clip)}
+    </article>`;
+}
+
+function renderShareControl(clip) {
+  // The operator's default may not be one of the three offered lengths, and a select
+  // whose options exclude the value it claims to default to silently picks the first.
+  const preferred = Number(state.shareExpiry.get(clip.id)) || Number(videoFeature().shareDefaultDays) || 7;
+  const choices = [...new Set([...SHARE_EXPIRY_CHOICES, preferred])].sort((a, b) => a - b);
+  return `
+    <select class="share-expiry" data-share-days aria-label="How long the public link lasts">
+      ${choices
+        .map(
+          (days) =>
+            `<option value="${days}"${days === preferred ? " selected" : ""}>${days} day${days === 1 ? "" : "s"}</option>`
+        )
+        .join("")}
+    </select>
+    <button type="button" class="btn btn-secondary btn-sm" data-share-create>
+      ${clip.share ? "New public link" : "Create public link"}
+    </button>`;
+}
+
+function renderShareBox(clip) {
+  const revealed = state.revealedShares.get(clip.id);
+  if (revealed) {
+    return `
+      <div class="share-box is-fresh">
+        <p class="share-note">
+          Copy this now. The server keeps only a hash of the link, so this is the one and
+          only time it can be shown — losing it means generating a new one, which stops
+          this one working.
+        </p>
+        <div class="share-url-row">
+          <input class="share-url" readonly value="${escapeHtml(revealed)}" aria-label="Public link for this clip" />
+          <button type="button" class="btn btn-secondary btn-sm" data-share-copy>Copy</button>
+        </div>
+        <div class="share-foot">
+          ${renderShareMeta(clip.share)}
+          <button type="button" class="btn btn-ghost btn-sm clip-destructive" data-share-revoke>Revoke</button>
+        </div>
+      </div>`;
+  }
+
+  const share = clip.share;
+  if (!share) return "";
+
+  if (shareActive(share)) {
+    return `
+      <div class="share-box">
+        <p class="share-note">
+          A public link is live for this clip. It was shown once when it was made and
+          cannot be shown again — generate a new one to get a link you can copy, which
+          stops the old one working.
+        </p>
+        ${renderShareMeta(share)}
+        <div class="clip-actions">
+          ${renderShareControl(clip)}
+          <button type="button" class="btn btn-ghost btn-sm clip-destructive" data-share-revoke>Revoke</button>
+        </div>
+      </div>`;
+  }
+
+  return `
+    <div class="share-box">
+      <p class="share-note">
+        ${share.revokedAt ? "The public link for this clip was revoked" : "The public link for this clip expired"}
+        · ${escapeHtml(shareViewsText(share))}
+      </p>
+    </div>`;
+}
+
+// Whether to describe a link as live. The server enforces both conditions on every
+// request; this only exists so the UI never calls a dead link a working one.
+function shareActive(share) {
+  if (!share || share.revokedAt) return false;
+  const expiresAt = Date.parse(share.expiresAt);
+  return !Number.isFinite(expiresAt) || expiresAt > Date.now();
+}
+
+function renderShareMeta(share) {
+  if (!share) return "";
+  const bits = [
+    share.expiresAt ? `expires ${formatDayTime(share.expiresAt)}` : "",
+    shareViewsText(share),
+    share.lastViewedAt ? `last opened ${formatDayTime(share.lastViewedAt)}` : ""
+  ].filter(Boolean);
+  return `<p class="share-meta">${escapeHtml(bits.join(" · "))}</p>`;
+}
+
+function shareViewsText(share) {
+  const views = Number(share?.views) || 0;
+  return `${views} view${views === 1 ? "" : "s"}`;
+}
+
+/* ---------- Video events ---------- */
+
+function handleVideoClick(event) {
+  const seek = event.target.closest("[data-seek]");
+  if (seek) {
+    seekVideo(Number(seek.dataset.seek));
+    return;
+  }
+
+  const meeting = (state.meetings || []).find((item) => item.id === state.selectedId);
+  if (!meeting) return;
+
+  const recordToggle = event.target.closest("[data-video-toggle]");
+  if (recordToggle) {
+    void setRecordVideo(meeting, recordToggle.dataset.videoToggle === "on", recordToggle);
+    return;
+  }
+
+  if (event.target.closest("[data-clip-here]")) {
+    const player = detail.querySelector("[data-video-player]");
+    const at = Number(player?.currentTime) || 0;
+    openClipDialog(meeting, { start: at, end: at });
+    return;
+  }
+
+  const clipOpen = event.target.closest("[data-clip-open]");
+  if (clipOpen) {
+    openClipDialog(meeting, {
+      start: Number(clipOpen.dataset.clipStart) || 0,
+      end: Number(clipOpen.dataset.clipEnd) || 0,
+      label: clipOpen.dataset.clipLabel || "",
+      sourceActionItemId: clipOpen.dataset.clipSource || ""
+    });
+    return;
+  }
+
+  const row = event.target.closest("[data-clip-id]");
+  if (!row) return;
+  const clipId = row.dataset.clipId;
+
+  if (event.target.closest("[data-clip-toggle]")) {
+    const opening = !state.openClips.has(clipId);
+    toggleInSet(state.openClips, clipId, opening);
+    renderCache.detail = "";
+    renderDetail();
+    // Started here rather than with an autoplay attribute: autoplay would restart a
+    // clip somebody had deliberately paused every time the pane happened to redraw.
+    if (opening) playClip(clipId);
+    return;
+  }
+  const copy = event.target.closest("[data-share-copy]");
+  if (copy) {
+    void copyShareUrl(copy, row);
+    return;
+  }
+  const create = event.target.closest("[data-share-create]");
+  if (create) {
+    void createShareLink(meeting, clipId, row, create);
+    return;
+  }
+  const revoke = event.target.closest("[data-share-revoke]");
+  if (revoke) {
+    void revokeShareLink(meeting, clipId, revoke);
+    return;
+  }
+  const remove = event.target.closest("[data-clip-delete]");
+  if (remove) void deleteClip(meeting, clipId, remove);
+}
+
+function handleVideoChange(event) {
+  const select = event.target.closest("[data-share-days]");
+  const clipId = select?.closest("[data-clip-id]")?.dataset.clipId;
+  if (!clipId) return;
+  // Remembered rather than read only at click time: the pane re-renders under this
+  // select every poll tick, and snapping back to the default after somebody picked 30
+  // days would misstate what the button next to it is about to do.
+  state.shareExpiry.set(clipId, Number(select.value));
+}
+
+function seekVideo(seconds) {
+  const player = detail.querySelector("[data-video-player]");
+  if (!player || !Number.isFinite(seconds)) return;
+  // Nudged back a beat: a row's start time is where the transcriber decided the words
+  // began, which is reliably a fraction late for the first syllable.
+  player.currentTime = Math.max(0, seconds - 0.4);
+  void player.play().catch(() => {});
+  syncSeekHighlight(player.currentTime);
+  // Clicking a row eight hundred lines down is useless if the player is off-screen —
+  // but scrolling one that is already visible would throw away the reader's place.
+  const box = player.getBoundingClientRect();
+  if (box.bottom < 0 || box.top > window.innerHeight) {
+    player.scrollIntoView({ block: "center", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+  }
+}
+
+function playClip(clipId) {
+  const player = [...detail.querySelectorAll("[data-clip-id]")]
+    .find((row) => row.dataset.clipId === clipId)
+    ?.querySelector("[data-clip-player]");
+  void player?.play().catch(() => {});
+}
+
+function wireVideoPlayer(playhead) {
+  indexSeekGroups();
+  const player = detail.querySelector("[data-video-player]");
+  if (!player) return;
+  player.addEventListener("timeupdate", handleVideoTimeUpdate);
+  // Scrubbing has to move the highlight at once; the throttle below is for playback.
+  player.addEventListener("seeked", () => syncSeekHighlight(player.currentTime));
+  restorePlayhead(player, playhead);
+}
+
+// Any video in the pane that is actually running — the recording or an open clip.
+function isWatchingVideo() {
+  return [...detail.querySelectorAll("video")].some((player) => !player.paused && !player.ended);
+}
+
+// The pane is rebuilt with innerHTML, which destroys the <video> along with its position.
+// A deliberate redraw during playback — a clip landing, the action-item editor opening —
+// therefore carries the playhead across instead of dumping the viewer back to zero.
+function capturePlayhead() {
+  const player = detail.querySelector("[data-video-player]");
+  if (!player || !player.currentTime) return null;
+  return { meetingId: player.dataset.videoPlayer, time: player.currentTime, paused: player.paused };
+}
+
+function restorePlayhead(player, saved) {
+  if (!saved || saved.meetingId !== player.dataset.videoPlayer) return;
+  const seek = () => {
+    player.currentTime = saved.time;
+    if (!saved.paused) void player.play().catch(() => {});
+  };
+  // Setting currentTime on a source whose metadata has not arrived is silently dropped.
+  if (player.readyState > 0) seek();
+  else player.addEventListener("loadedmetadata", seek, { once: true });
+}
+
+/* One entry per transcript list, each sorted by time already. The two folds cover the
+   same timeline, so a single flat index would not be sorted and the "which row is
+   playing" lookup would land on whichever list came second in the DOM. */
+let seekGroups = [];
+let lastHighlightAt = 0;
+
+function indexSeekGroups() {
+  seekGroups = [...detail.querySelectorAll("[data-seek-group]")].map((group) => {
+    const nodes = [...group.querySelectorAll("[data-line-start]")];
+    return { nodes, times: nodes.map((node) => Number(node.dataset.lineStart) || 0), active: -1 };
+  });
+}
+
+function handleVideoTimeUpdate(event) {
+  // timeupdate is a firehose while scrubbing. Six updates a second is more than the eye
+  // needs, and the real saving is below: a tick landing on the same row does nothing.
+  const now = performance.now();
+  if (now - lastHighlightAt < 150) return;
+  lastHighlightAt = now;
+  syncSeekHighlight(event.target.currentTime);
+}
+
+// Never re-renders the transcript. A 2000-segment meeting would rebuild 2000 nodes four
+// times a second; this touches two nodes per list, and only when the row actually
+// changes.
+function syncSeekHighlight(seconds) {
+  for (const group of seekGroups) {
+    const index = lastIndexAtOrBefore(group.times, seconds);
+    if (index === group.active) continue;
+    group.nodes[group.active]?.classList.remove("is-playing");
+    group.nodes[index]?.classList.add("is-playing");
+    group.active = index;
+  }
+}
+
+function lastIndexAtOrBefore(times, value) {
+  let low = 0;
+  let high = times.length - 1;
+  let found = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (times[mid] <= value) {
+      found = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return found;
+}
+
+/* ---------- Clip composer ---------- */
+
+// Padded either side because the interesting part is never the sentence on its own: a
+// commitment lands mid-conversation, and the line before it is the context that makes
+// the clip worth sending to anyone.
+function openClipDialog(meeting, { start, end, label = "", sourceActionItemId = "" }) {
+  state.clipDraft = { meetingId: meeting.id, sourceActionItemId: sourceActionItemId || null };
+  const durationMs = Number(meeting.video?.durationMs) || 0;
+  const startMs = Math.max(0, Math.round(start * 1000) - CLIP_LEAD_SECONDS * 1000);
+  const padded = Math.round(Math.max(end, start) * 1000) + CLIP_TAIL_SECONDS * 1000;
+  const endMs = durationMs ? Math.min(padded, durationMs) : padded;
+
+  clipLabelInput.value = label.slice(0, 120);
+  clipStartInput.value = formatTimecode(startMs, 1);
+  clipEndInput.value = formatTimecode(endMs, 1);
+  clipError.textContent = "";
+  renderClipLengthHint();
+  clipDialog.showModal();
+  clipLabelInput.focus();
+}
+
+function renderClipLengthHint() {
+  const startMs = parseClockInput(clipStartInput.value);
+  const endMs = parseClockInput(clipEndInput.value);
+  const cap = Number(videoFeature().maxClipSeconds) || NO_VIDEO_FEATURE.maxClipSeconds;
+  if (startMs === null || endMs === null || endMs <= startMs) {
+    clipLengthHint.textContent = `Times are mm:ss. Up to ${cap} seconds.`;
+    return;
+  }
+  const seconds = (endMs - startMs) / 1000;
+  clipLengthHint.textContent =
+    seconds > cap ? `${seconds.toFixed(1)}s — longer than the ${cap}s cap.` : `${seconds.toFixed(1)}s clip.`;
+}
+
+async function handleCreateClip(event) {
+  event.preventDefault();
+  const draft = state.clipDraft;
+  if (!draft) return;
+
+  const startMs = parseClockInput(clipStartInput.value);
+  const endMs = parseClockInput(clipEndInput.value);
+  const cap = Number(videoFeature().maxClipSeconds) || NO_VIDEO_FEATURE.maxClipSeconds;
+
+  // Checked here only so the answer is instant. The server validates the same range
+  // against the recording it will actually cut, and that is the copy that decides.
+  if (startMs === null || endMs === null) {
+    clipError.textContent = "Give a start and an end as mm:ss.";
+    return;
+  }
+  if (endMs <= startMs) {
+    clipError.textContent = "A clip has to end after it starts.";
+    return;
+  }
+  if ((endMs - startMs) / 1000 > cap) {
+    clipError.textContent = `Clips are capped at ${cap} seconds.`;
+    return;
+  }
+
+  clipError.textContent = "";
+  clipCreateButton.disabled = true;
+  clipCreateButton.textContent = "Cutting…";
+  try {
+    const { clip } = await api(`/api/meetings/${draft.meetingId}/clips`, {
+      method: "POST",
+      body: JSON.stringify({
+        label: clipLabelInput.value,
+        startMs,
+        endMs,
+        ...(draft.sourceActionItemId ? { sourceActionItemId: draft.sourceActionItemId } : {})
+      })
+    });
+    // Opened straight away: the only way to know a cut landed on the right words is to
+    // watch it.
+    if (clip?.id) state.openClips.add(clip.id);
+    state.clipDraft = null;
+    clipDialog.close();
+    await reloadMeeting(draft.meetingId);
+    if (clip?.id) playClip(clip.id);
+  } catch (error) {
+    clipError.textContent = error.message;
+  } finally {
+    clipCreateButton.disabled = false;
+    clipCreateButton.textContent = "Create clip";
+  }
+}
+
+/* ---------- Clip sharing ---------- */
+
+async function createShareLink(meeting, clipId, row, button) {
+  const clip = (meeting.clips || []).find((item) => item.id === clipId);
+  // Generating a new link retires the one already out there. Anyone holding it loses
+  // access the moment this returns, which is not something to do by accident.
+  if (
+    shareActive(clip?.share) &&
+    !confirm("Generate a new link? The link already shared for this clip stops working immediately.")
+  ) {
+    return;
+  }
+
+  const select = row.querySelector("[data-share-days]");
+  const expiresInDays =
+    Number(select?.value) || Number(state.shareExpiry.get(clipId)) || Number(videoFeature().shareDefaultDays) || 7;
+
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Creating…";
+  try {
+    const { url } = await api(`/api/meetings/${meeting.id}/clips/${clipId}/share`, {
+      method: "POST",
+      body: JSON.stringify({ expiresInDays })
+    });
+    // The only copy of this URL that will ever exist on this machine.
+    state.revealedShares.set(clipId, url);
+    await reloadMeeting(meeting.id);
+  } catch (error) {
+    setAppError(error.message);
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+async function revokeShareLink(meeting, clipId, button) {
+  if (!confirm("Revoke this link? Anyone holding it loses access immediately.")) return;
+  button.disabled = true;
+  button.textContent = "Revoking…";
+  try {
+    await api(`/api/meetings/${meeting.id}/clips/${clipId}/share`, { method: "DELETE" });
+    state.revealedShares.delete(clipId);
+    await reloadMeeting(meeting.id);
+  } catch (error) {
+    setAppError(error.message);
+    button.disabled = false;
+    button.textContent = "Revoke";
+  }
+}
+
+async function setRecordVideo(meeting, recordVideo, button) {
+  button.disabled = true;
+  try {
+    await api(`/api/meetings/${meeting.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ recordVideo })
+    });
+    await reloadMeeting(meeting.id);
+  } catch (error) {
+    setAppError(error.message);
+    button.disabled = false;
+  }
+}
+
+async function deleteClip(meeting, clipId, button) {
+  if (!confirm("Delete this clip? Any public link for it stops working.")) return;
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  try {
+    await api(`/api/meetings/${meeting.id}/clips/${clipId}`, { method: "DELETE" });
+    state.openClips.delete(clipId);
+    state.revealedShares.delete(clipId);
+    state.shareExpiry.delete(clipId);
+    await reloadMeeting(meeting.id);
+  } catch (error) {
+    setAppError(error.message);
+    button.disabled = false;
+    button.textContent = "Delete";
+  }
+}
+
+async function copyShareUrl(button, row) {
+  const field = row.querySelector(".share-url");
+  if (!field) return;
+  try {
+    await navigator.clipboard.writeText(field.value);
+    button.textContent = "Copied";
+    setTimeout(() => (button.textContent = "Copy"), 1500);
+  } catch {
+    // Clipboard access is denied outside a secure context; selecting the text at least
+    // leaves a working Cmd-C behind.
+    field.select();
+  }
+}
+
+// A clip or share change touches exactly one meeting. Refetching that one keeps the full
+// transcript already in memory, instead of round-tripping the whole list and then paying
+// for the transcript again behind it.
+async function reloadMeeting(id) {
+  try {
+    const { meeting } = await api(`/api/meetings/${id}`);
+    replaceMeeting(meeting);
+  } catch (error) {
+    setAppError(error.message);
+  }
+  renderCache.detail = "";
+  renderDetail();
 }
 
 /* ---------- Calendar view ---------- */
@@ -1836,6 +2610,9 @@ function renderCalendar() {
     </div>
   `;
 
+  // The transcript that the seek index pointed at is gone with the innerHTML above.
+  indexSeekGroups();
+
   detail.querySelector("#cal-prev").addEventListener("click", () => shiftWeek(-1));
   detail.querySelector("#cal-next").addEventListener("click", () => shiftWeek(1));
   detail.querySelector("#cal-today").addEventListener("click", () => shiftWeek(0, true));
@@ -1941,8 +2718,20 @@ function renderDeliveryNote(meeting) {
 function openCreateDialog() {
   meetingForm.reset();
   formError.textContent = "";
+  fillRecordVideoField();
   createDialog.showModal();
   $("#title").focus();
+}
+
+// Recording is an operator decision first and a per-meeting one second: the checkbox
+// only exists on an install where VIDEO_RECORDING_ENABLED is on, and there it defaults
+// to whatever the operator set as the house default.
+function fillRecordVideoField() {
+  const video = videoFeature();
+  recordVideoField.hidden = !video.enabled;
+  if (!video.enabled) return;
+  recordVideoInput.checked = video.recordByDefault !== false;
+  recordVideoHint.textContent = `Kept ${video.retentionDays} day${video.retentionDays === 1 ? "" : "s"}, and never longer than this meeting's transcript.`;
 }
 
 async function handleCreateMeeting(event) {
@@ -1956,6 +2745,10 @@ async function handleCreateMeeting(event) {
   if (payload.scheduledAt) {
     payload.scheduledAt = new Date(payload.scheduledAt).toISOString();
   }
+  // Sent as a real boolean rather than through FormData, which reports a ticked box as
+  // the string "on" and omits an unticked one entirely — neither of which a server can
+  // tell apart from "the client is too old to know about video".
+  if (videoFeature().enabled) payload.recordVideo = recordVideoInput.checked;
 
   try {
     const { meeting } = await api("/api/meetings", {
@@ -2257,4 +3050,47 @@ function formatTime(seconds) {
   const minutes = Math.floor(total / 60).toString().padStart(2, "0");
   const remainder = (total % 60).toString().padStart(2, "0");
   return `${minutes}:${remainder}`;
+}
+
+// Milliseconds to a timecode, growing an hours field only when there are hours. Clip
+// bounds get a decimal because a tenth of a second is the difference between catching
+// the start of a sentence and cutting into it.
+function formatTimecode(ms, decimals = 0) {
+  const total = Math.max(0, Number(ms) || 0) / 1000;
+  const hours = Math.floor(total / 3600);
+  const minutes = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
+  const rest = total % 60;
+  const seconds = (decimals ? rest.toFixed(decimals) : String(Math.floor(rest))).padStart(decimals ? decimals + 3 : 2, "0");
+  return hours ? `${hours}:${minutes}:${seconds}` : `${minutes}:${seconds}`;
+}
+
+// Accepts "90", "1:30", "1:30.5" and "1:02:03" — clip bounds are typed by hand, and
+// every one of those is unambiguously what the person meant. Returns null rather than
+// NaN or 0, so "unparseable" cannot be mistaken for "the start of the recording".
+function parseClockInput(value) {
+  const parts = String(value ?? "").trim().split(":");
+  if (parts.length > 3) return null;
+  let seconds = 0;
+  for (const part of parts) {
+    if (!/^\d+(\.\d+)?$/u.test(part)) return null;
+    seconds = seconds * 60 + Number(part);
+  }
+  return Number.isFinite(seconds) ? Math.round(seconds * 1000) : null;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB"];
+  let scaled = value / 1024;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${scaled >= 10 ? Math.round(scaled) : scaled.toFixed(1)} ${units[unit]}`;
+}
+
+function prefersReducedMotion() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
