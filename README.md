@@ -233,6 +233,61 @@ notes are yours, and nothing here is a lock-in.
   file per meeting. Exports are owner-scoped and rate limited, and the JSON never
   includes internal fields like the recording worker's lease.
 
+## Video recording
+
+Off by default. Set `VIDEO_RECORDING_ENABLED=true` and the bot records what its own
+Chrome window sees — the Meet grid, whoever is speaking, and any screen share — as
+H.264 at 1280x720 and 15fps, with audio from the same PulseAudio monitor the
+transcript comes from. Once the operator turns it on, every new meeting records
+unless the person creating it unticks the box.
+
+**Video can never break transcription.** Capture is a second `ffmpeg` process, not
+part of the audio one, and its exit is not what ends the meeting. If it dies, stalls,
+or was never able to start, the meeting is marked `video: failed`, a line lands in
+the run log, and the transcript, notes, and action items finish exactly as they
+would have. The transcript is the product; video is additive.
+
+The worker container has no writable volume, so recorded bytes travel to the web app
+over the runner API in chunks — the same path transcript segments already take — and
+are written under `data/media/`. A worker killed mid-meeting leaves a shorter file,
+not a broken one.
+
+**Disk is the real cost.** Roughly 1.5–3 MB per minute depending on motion and screen
+sharing, so a 48-minute meeting is about 70–150 MB and a week of team meetings is a
+few GB. Three limits keep that bounded:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `VIDEO_RETENTION_DAYS` | 7 | Ceiling on how long a recording is kept |
+| `VIDEO_DISK_BUDGET_GB` | 20 | Size of `data/media/`; oldest recordings evicted first |
+| `VIDEO_MIN_FREE_DISK_GB` | 5 | Capture refuses to start below this much free space |
+
+Retention is a ceiling, not an extension: the effective window is
+`min(VIDEO_RETENTION_DAYS, the meeting's own retentionDays)`, so **video is always
+gone by the time the transcript is** — never after it. The free-space floor exists
+because a full disk also means `meetings.json` cannot be rewritten, which would take
+transcription down with it.
+
+### Clips and sharing
+
+Recordings are internal. Playback needs a signed-in session and only ever serves your
+own meetings; someone else's meeting id returns 404, the same as everywhere else in
+the app. From a recording you can cut a clip — up to `VIDEO_MAX_CLIP_SECONDS`
+(default 5 minutes), including straight from an action item, so the 40 seconds where
+someone actually agreed to it stays attached to the task. Clips are internal too.
+
+A single clip can then be opted into a **public link**. That link is unguessable,
+expires (`VIDEO_SHARE_DEFAULT_DAYS`, default 7), counts its views, and can be revoked
+on the spot. Only the token's SHA-256 hash is stored, so the URL is shown **exactly
+once**, when you create it — there is no "copy again", only "regenerate". Someone who
+walks off with a copy of `meetings.json` gets no working video links out of it.
+Sharing is per clip and never covers the whole recording, and public responses are
+sent `Cache-Control: private, no-store` with `X-Robots-Tag: noindex, nofollow`.
+
+Purging a recording — on retention, on disk eviction, or when you delete it — takes
+its clips with it and kills their share links in the same move. An expired or revoked
+link returns 404, not a page confirming that the clip exists.
+
 ## The fragile part (please read before filing a bug)
 
 Speaker names come from best-effort DOM scraping of the Meet UI, and Google
@@ -252,6 +307,11 @@ none of that substitutes for actually telling participants. Automated
 participants also sit in a gray area of Google's terms of service; bot accounts
 that join many meetings can get flagged, so use a dedicated account.
 
+Video raises the stakes rather than changing them: a transcript is words, a
+recording is faces. That is why `VIDEO_RECORDING_ENABLED` is false out of the box —
+upgrading an instance must never start recording people who were only ever told
+they were being transcribed.
+
 ## Security notes
 
 Meeting audio and transcripts are sensitive. The defaults are sane — hashed
@@ -264,6 +324,11 @@ before exposing an instance to real teams you should also know:
   transcripts once they are older than the meeting's `retentionDays`, keeping the
   meeting record and its generated notes. The clock starts when the transcript was
   captured, not when the meeting was created.
+- Video, when enabled, is purged by the same sweep under the tighter of its own
+  ceiling and the meeting's retention, plus a global disk budget with oldest-first
+  eviction. Purging deletes the files and revokes any live share links with them.
+  Share tokens are stored hashed, so a leak of `meetings.json` yields no playable
+  link. See "Video recording".
 - **Behind a reverse proxy, set `TRUST_PROXY_HOPS`** to the number of proxies you
   control (`1` for a single Caddy or nginx in front). Leave it at `0` and every
   request appears to come from the proxy, so all users share one rate-limit bucket
