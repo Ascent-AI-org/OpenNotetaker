@@ -48,8 +48,20 @@ services:
       FFMPEG_PATH: /usr/bin/ffmpeg
       AUDIO_CAPTURE_DRIVER: pulse
       AUDIO_CAPTURE_SOURCE: open_notetaker.monitor
+      # Video capture, pinned for the same reason as the audio stack above: on a Mac
+      # .env says avfoundation and a screen index, and that would grab nothing here.
+      # x11grab reads the Xvfb display Chrome is drawing on, and the capture size and
+      # the screen are one setting in two places — capture larger than the screen and
+      # you record black bars, smaller and the call is cropped out of frame.
+      XVFB_SCREEN: 1280x720x24
+      VIDEO_CAPTURE_DRIVER: x11grab
+      VIDEO_CAPTURE_SOURCE: ":99"
+      VIDEO_SIZE: 1280x720
     volumes:
       - open-notetaker-bot-profile:/seed/bot-profile:ro
+    # No writable volume here on purpose. Recorded video is streamed to the web app
+    # over the runner API in chunks, exactly like transcript segments, and lands in
+    # open-notetaker-data — so a worker that dies takes no recording with it.
     depends_on:
       - open-notetaker
     shm_size: "1gb"
