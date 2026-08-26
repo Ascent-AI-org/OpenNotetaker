@@ -105,6 +105,35 @@ export function readConfig({ rootDir = defaultRootDir() } = {}) {
       audioCaptureDriver: process.env.AUDIO_CAPTURE_DRIVER || "pulse",
       audioCaptureSource: process.env.AUDIO_CAPTURE_SOURCE || "default"
     },
+    video: {
+      // Off until an operator opts in: video is the one artifact that can fill a disk,
+      // and recording someone's face is a bigger consent question than transcribing
+      // them. Once it is on, individual meetings default to recording with an opt-out.
+      enabled: parseBoolean(process.env.VIDEO_RECORDING_ENABLED, false),
+      recordByDefault: parseBoolean(process.env.VIDEO_RECORD_BY_DEFAULT, true),
+      // A ceiling, not an extension — the effective window is min(this, the meeting's
+      // own retentionDays), so video can never outlive the transcript it belongs to.
+      retentionDays: parsePositiveInt(process.env.VIDEO_RETENTION_DAYS, 7),
+      diskBudgetGb: parsePositiveInt(process.env.VIDEO_DISK_BUDGET_GB, 20),
+      maxMb: parsePositiveInt(process.env.VIDEO_MAX_MB, 2048),
+      // Recording stops before the disk is full: a box with no free space cannot write
+      // meetings.json either, which would take transcription down with it.
+      minFreeDiskGb: parsePositiveInt(process.env.VIDEO_MIN_FREE_DISK_GB, 5),
+      maxClipSeconds: parsePositiveInt(process.env.VIDEO_MAX_CLIP_SECONDS, 300),
+      shareDefaultDays: parsePositiveInt(process.env.VIDEO_SHARE_DEFAULT_DAYS, 7),
+      // Defaults match the worker container: Xvfb on :99 at 1280x720x24, where Chrome
+      // is the only window. See docker/entrypoint.sh.
+      captureDriver: process.env.VIDEO_CAPTURE_DRIVER || "x11grab",
+      captureSource: process.env.VIDEO_CAPTURE_SOURCE || ":99",
+      framerate: parsePositiveInt(process.env.VIDEO_FRAMERATE, 15),
+      size: process.env.VIDEO_SIZE || "1280x720",
+      // A screen share is mostly static text, so a high CRF and a fast preset keep both
+      // the file and the worker's CPU small — the same CPU the audio capture that feeds
+      // transcription is competing for.
+      crf: parsePositiveInt(process.env.VIDEO_CRF, 30),
+      preset: process.env.VIDEO_PRESET || "veryfast",
+      mediaDir: resolve(dataDir, "media")
+    },
     stt: {
       provider: process.env.STT_PROVIDER || "deepgram",
       deepgram: {
