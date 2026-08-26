@@ -12,7 +12,10 @@ export class MeetBrowserBot {
     chromeLaunchMode,
     chromeExtraArgs = [],
     headless,
-    aloneTimeoutMs = 45_000
+    aloneTimeoutMs = 45_000,
+    scheduledStartAt = "",
+    admissionGraceMs = 10 * 60_000,
+    noShowGraceMs = 10 * 60_000
   }) {
     this.meetUrl = meetUrl;
     // Every Meet state-detection regex below matches English UI strings, so force the
@@ -26,6 +29,16 @@ export class MeetBrowserBot {
     this.chromeExtraArgs = chromeExtraArgs;
     this.headless = headless;
     this.aloneTimeoutMs = Math.max(5000, Number(aloneTimeoutMs) || 45_000);
+    // Calendar autostart dispatches the bot minutes BEFORE the meeting starts, so every
+    // patience timer is anchored to the scheduled start rather than to bot launch.
+    // Without this the bot asks to join ~85s early, waits 90s, and gives up seconds
+    // after the start time — before any human is there to admit it.
+    this.scheduledStartMs = Date.parse(scheduledStartAt || "");
+    this.admissionGraceMs = Math.max(0, Number(admissionGraceMs) || 0);
+    this.noShowGraceMs = Math.max(0, Number(noShowGraceMs) || 0);
+    // Once a real participant has been seen, an empty call means the meeting ended and
+    // the short alone timeout applies again.
+    this.sawOtherParticipants = false;
     this.browser = null;
     this.context = null;
     this.page = null;
@@ -34,6 +47,32 @@ export class MeetBrowserBot {
     this.cdpSocket = null;
     this.cdpPending = new Map();
     this.cdpMessageId = 0;
+  }
+
+  // How long to keep waiting for admission after clicking Ask to join / Join now.
+  admissionTimeoutFor(action) {
+    return admissionTimeoutMs({
+      baseTimeoutMs: action === "asked" || action === "ask" ? 90_000 : 30_000,
+      scheduledStartMs: this.scheduledStartMs,
+      graceMs: this.admissionGraceMs,
+      nowMs: Date.now()
+    });
+  }
+
+  // Records that the bot is not the only participant, which re-arms the short alone
+  // timeout for the "everyone left" case.
+  noteParticipantState(status) {
+    if (status === "admitted") this.sawOtherParticipants = true;
+  }
+
+  aloneExpired(aloneSinceMs) {
+    return Date.now() >= aloneDeadlineMs({
+      aloneSinceMs,
+      sawOthers: this.sawOtherParticipants,
+      aloneTimeoutMs: this.aloneTimeoutMs,
+      scheduledStartMs: this.scheduledStartMs,
+      noShowGraceMs: this.noShowGraceMs
+    });
   }
 
   async join() {
@@ -137,7 +176,7 @@ export class MeetBrowserBot {
       if (lastState.status === "admitted") return;
       if (lastState.status === "asked" || lastState.status === "join_clicked") {
         await this.waitForRawCdpAdmission({
-          timeoutMs: lastState.status === "asked" ? 90_000 : 30_000
+          timeoutMs: this.admissionTimeoutFor(lastState.status)
         });
         return;
       }
@@ -448,7 +487,7 @@ export class MeetBrowserBot {
       if (lastState.status === "admitted") return;
       if (lastState.status === "asked" || lastState.status === "join_clicked") {
         await this.waitForAppleScriptAdmission({
-          timeoutMs: lastState.status === "asked" ? 90_000 : 30_000
+          timeoutMs: this.admissionTimeoutFor(lastState.status)
         });
         return;
       }
@@ -588,7 +627,7 @@ export class MeetBrowserBot {
             await page.waitForTimeout(candidate.action === "continue" ? 2500 : 5000);
             if (candidate.action !== "continue") {
               await this.waitForMeetingAdmission({
-                timeoutMs: candidate.action === "ask" ? 90_000 : 30_000
+                timeoutMs: this.admissionTimeoutFor(candidate.action)
               });
               return;
             }
@@ -679,12 +718,13 @@ export class MeetBrowserBot {
       if (state.status === "refused") throw new Error(state.message);
       if (state.status === "alone") {
         aloneSince ??= Date.now();
-        if (Date.now() - aloneSince >= this.aloneTimeoutMs) {
+        if (this.aloneExpired(aloneSince)) {
           await this.leavePlaywrightMeeting();
           return "alone_timeout";
         }
       } else {
         aloneSince = null;
+        this.noteParticipantState(state.status);
       }
       await onHeartbeat?.();
       await page.waitForTimeout(5000);
@@ -708,12 +748,13 @@ export class MeetBrowserBot {
       if (state.status === "refused") throw new Error(state.message);
       if (state.status === "alone") {
         aloneSince ??= Date.now();
-        if (Date.now() - aloneSince >= this.aloneTimeoutMs) {
+        if (this.aloneExpired(aloneSince)) {
           await this.leaveRawCdpMeeting();
           return "alone_timeout";
         }
       } else {
         aloneSince = null;
+        this.noteParticipantState(state.status);
       }
 
       await onHeartbeat?.();
@@ -738,12 +779,13 @@ export class MeetBrowserBot {
       if (state.status === "refused") throw new Error(state.message);
       if (state.status === "alone") {
         aloneSince ??= Date.now();
-        if (Date.now() - aloneSince >= this.aloneTimeoutMs) {
+        if (this.aloneExpired(aloneSince)) {
           await this.leaveAppleScriptMeeting();
           return "alone_timeout";
         }
       } else {
         aloneSince = null;
+        this.noteParticipantState(state.status);
       }
 
       await onHeartbeat?.();
@@ -865,6 +907,29 @@ export class MeetBrowserBot {
     if (!this.page) throw new Error("Meet page is not initialized.");
     return this.page;
   }
+}
+
+// The bot is dispatched before the meeting starts, so a flat timeout measured from
+// launch expires while the room is still empty. Hold the waiting room open until the
+// grace window past the scheduled start, and never shorten the original timeout.
+export function admissionTimeoutMs({ baseTimeoutMs, scheduledStartMs, graceMs, nowMs }) {
+  if (!Number.isFinite(scheduledStartMs)) return baseTimeoutMs;
+  return Math.max(baseTimeoutMs, scheduledStartMs + graceMs - nowMs);
+}
+
+// Two different situations look identical on screen (bot alone in the call) and need
+// opposite deadlines: nobody has arrived yet (wait through the no-show grace) versus
+// everyone has left (leave promptly).
+export function aloneDeadlineMs({
+  aloneSinceMs,
+  sawOthers,
+  aloneTimeoutMs,
+  scheduledStartMs,
+  noShowGraceMs
+}) {
+  const shortDeadline = aloneSinceMs + aloneTimeoutMs;
+  if (sawOthers || !Number.isFinite(scheduledStartMs)) return shortDeadline;
+  return Math.max(shortDeadline, scheduledStartMs + noShowGraceMs);
 }
 
 function withEnglishUiParam(meetUrl) {
