@@ -74,6 +74,10 @@ export async function recordMeeting({ meetingId }) {
   let videoFailingSinceMs = 0;
   let videoRetryTimer = null;
   let videoUploadQueued = false;
+  // When the encoder actually started, as opposed to when the first bytes reached the app.
+  // Those differ by the whole upload batch: a short meeting never reaches the 4MB batch
+  // threshold, so nothing is sent until the drain at the end and the two are minutes apart.
+  let videoStartedAt = "";
   const videoMaxBytes = parsePositiveInt(process.env.VIDEO_MAX_MB, 2048) * 1024 * 1024;
 
   function startSignalSampling() {
@@ -189,6 +193,7 @@ export async function recordMeeting({ meetingId }) {
       });
 
       let videoStderrEvents = 0;
+      videoStartedAt = new Date().toISOString();
       videoSource.start(queueVideoChunk, {
         onStderr: (message) => {
           if (videoStderrEvents >= 3) return;
@@ -307,7 +312,7 @@ export async function recordMeeting({ meetingId }) {
   async function sendVideoChunk(payload) {
     for (let attempt = 1; attempt <= VIDEO_UPLOAD_ATTEMPTS; attempt += 1) {
       try {
-        const { bytesReceived } = await api.appendVideoChunk(videoOffset, payload);
+        const { bytesReceived } = await api.appendVideoChunk(videoOffset, payload, { startedAt: videoStartedAt });
         // The server's own file size is the authority on where the next chunk goes.
         // Trusting it (rather than counting locally) is what lets a chunk the server
         // already applied but never acknowledged be retried harmlessly.

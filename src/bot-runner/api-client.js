@@ -68,9 +68,13 @@ export class RunnerApiClient {
   // server's partial file ends, and the server answers with its own size — that, not any
   // sequence number held here, is what makes a retried or restarted upload recover
   // instead of duplicating bytes into the middle of a media stream.
-  async appendVideoChunk(offset, buffer) {
+  async appendVideoChunk(offset, buffer, { startedAt = "" } = {}) {
+    // startedAt rides along on every chunk rather than being sent once: the server only
+    // reads it on the first bytes that land, and a worker retrying after a server restart
+    // has no way to know whether that first upload was the one that got through.
+    const startedParam = startedAt ? `&startedAt=${encodeURIComponent(startedAt)}` : "";
     return this.requestBytes(
-      `/api/runner/meetings/${this.requireMeetingId()}/video?offset=${encodeURIComponent(offset)}`,
+      `/api/runner/meetings/${this.requireMeetingId()}/video?offset=${encodeURIComponent(offset)}${startedParam}`,
       { body: buffer, timeoutMs: VIDEO_CHUNK_TIMEOUT_MS }
     );
   }

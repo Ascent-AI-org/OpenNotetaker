@@ -11,7 +11,7 @@ ENV NODE_ENV=production \
     BOT_CHROME_EXECUTABLE_PATH=/usr/bin/chromium \
     BOT_CHROME_USER_DATA_DIR=/app/.bot-profile \
     BOT_CHROME_LAUNCH_MODE=rawcdp \
-    BOT_CHROME_EXTRA_ARGS="--no-sandbox --disable-dev-shm-usage" \
+    BOT_CHROME_EXTRA_ARGS="--no-sandbox --disable-dev-shm-usage --window-size=1280,720 --window-position=0,0 --disable-infobars --test-type" \
     BOT_HEADLESS=false
 
 RUN apt-get update \

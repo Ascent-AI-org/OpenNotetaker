@@ -26,6 +26,10 @@ const KILL_TIMEOUT_MS = 2_000;
 
 // Pure so the exact argv can be pinned by tests without spawning anything: an ffmpeg
 // flag typo only shows up as "exited with code 1" an hour into a real meeting.
+// Packets ffmpeg may hold per input before the producing thread blocks. 512 at 15fps is
+// roughly 30 seconds of headroom for a stall, against the default 8 (about half a second).
+const THREAD_QUEUE_SIZE = 512;
+
 export function buildVideoArgs({
   driver = "x11grab",
   source = "",
@@ -42,16 +46,27 @@ export function buildVideoArgs({
   const quality = requirePositiveInt(crf, "VIDEO_CRF");
   const inputs = [];
 
+  // ffmpeg's default input queue is 8 packets. The screen grabber and the audio monitor
+  // are read by separate threads, and when one stalls behind the encoder the other's queue
+  // overflows — ffmpeg then drops frames and the video drifts out of sync with the audio
+  // the transcript is built from. It logged "Thread message queue blocking" on the very
+  // first production recording, on an idle screen; a real meeting on a worker that is also
+  // running Chrome and streaming to Deepgram has far less headroom.
   if (driver === "x11grab") {
+    inputs.push("-thread_queue_size", String(THREAD_QUEUE_SIZE));
     inputs.push("-f", "x11grab", "-framerate", String(fps), "-video_size", String(size), "-i", String(source));
     // The video's audio track comes off the same PulseAudio monitor the transcription
     // capture reads; Pulse fans a monitor source out to every reader, so the two ffmpegs
     // do not compete for it. With no monitor configured the recording is silent rather
     // than absent.
-    if (audioSource) inputs.push("-f", "pulse", "-i", String(audioSource));
+    if (audioSource) {
+      inputs.push("-thread_queue_size", String(THREAD_QUEUE_SIZE));
+      inputs.push("-f", "pulse", "-i", String(audioSource));
+    }
   } else if (driver === "avfoundation") {
     // macOS local dev only. avfoundation takes video and audio as one "<video>:<audio>"
     // device string, so there is no second input to add and audioSource is not used.
+    inputs.push("-thread_queue_size", String(THREAD_QUEUE_SIZE));
     inputs.push("-f", "avfoundation", "-framerate", String(fps), "-video_size", String(size), "-i", String(source));
   } else {
     throw new Error(`Unsupported VIDEO_CAPTURE_DRIVER: ${driver}.`);

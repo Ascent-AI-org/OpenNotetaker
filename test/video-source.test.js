@@ -38,6 +38,8 @@ test("x11grab capture grabs the worker's Xvfb display and the PulseAudio monitor
     "-hide_banner",
     "-loglevel",
     "warning",
+    "-thread_queue_size",
+    "512",
     "-f",
     "x11grab",
     "-framerate",
@@ -46,6 +48,8 @@ test("x11grab capture grabs the worker's Xvfb display and the PulseAudio monitor
     "1280x720",
     "-i",
     ":99",
+    "-thread_queue_size",
+    "512",
     "-f",
     "pulse",
     "-i",
@@ -236,4 +240,31 @@ test("a single chunk larger than the cap is still sent, or the upload loop stall
 
   assert.equal(count, 1);
   assert.equal(bytes, 9 * MB);
+});
+
+test("gives every input its own enlarged packet queue", () => {
+  const args = buildVideoArgs({
+    driver: "x11grab",
+    source: ":99",
+    audioSource: "open_notetaker.monitor"
+  });
+
+  // One per input. ffmpeg's default of 8 packets is about half a second at 15fps, and a
+  // stalled encoder overflows it long before the other input notices.
+  const queueFlags = args.filter((arg) => arg === "-thread_queue_size");
+  assert.equal(queueFlags.length, 2);
+
+  // The flag configures the input that FOLLOWS it, so it has to sit before each -f.
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] !== "-thread_queue_size") continue;
+    assert.equal(Number.isInteger(Number(args[i + 1])), true);
+    assert.ok(Number(args[i + 1]) >= 512);
+    assert.equal(args[i + 2], "-f");
+  }
+});
+
+test("still enlarges the queue when there is no audio monitor to record", () => {
+  const args = buildVideoArgs({ driver: "x11grab", source: ":99", audioSource: "" });
+  assert.equal(args.filter((a) => a === "-thread_queue_size").length, 1);
+  assert.equal(args.includes("-i"), true);
 });

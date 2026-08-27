@@ -122,3 +122,22 @@ function sanitizeLowConfidenceWords(value) {
     }))
     .filter((item) => item.word);
 }
+
+/**
+ * A capture-start timestamp reported by a recording worker.
+ *
+ * The worker's clock, not this server's, so it is validated rather than trusted: an
+ * authenticated runner is still a separate machine, and a skewed or malformed value would
+ * silently corrupt the video's retention anchor — the stamp that decides when a recording
+ * of someone's face gets deleted. Anything that is not a sane past instant falls back to
+ * now, which is what this stamped before workers reported it at all.
+ */
+export function sanitizeCaptureStart(value, { maxAgeMs = 3 * 60 * 60 * 1000, nowMs = Date.now() } = {}) {
+  const parsed = Date.parse(value || "");
+  const fallback = new Date(nowMs).toISOString();
+  if (!Number.isFinite(parsed)) return fallback;
+  // A capture cannot have begun after it was reported, so a future stamp is a broken clock.
+  if (parsed > nowMs) return fallback;
+  if (nowMs - parsed > maxAgeMs) return fallback;
+  return new Date(parsed).toISOString();
+}
