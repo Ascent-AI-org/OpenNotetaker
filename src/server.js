@@ -56,7 +56,7 @@ import {
   shouldReleaseClaim,
   shouldSalvageRecording
 } from "./domain/runner-jobs.js";
-import { isGoogleMeetUrl, sanitizeRawSegments, validateMeetingInput } from "./domain/validation.js";
+import { isGoogleMeetUrl, sanitizeRawSegments, validateMeetingInput, sanitizeCaptureStart } from "./domain/validation.js";
 import { MediaStore } from "./domain/media-store.js";
 import { effectiveVideoRetentionDays, planDiskEviction, planVideoPurge } from "./domain/video-retention.js";
 import { readRawBody, serveFileWithRange } from "./domain/video-http.js";
@@ -187,6 +187,9 @@ const exportLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, m
 // Cutting a clip is an ffmpeg re-encode on the same box that runs transcription, and it
 // writes a new file to the same disk. Both are bounded per account before the work starts.
 const clipLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
+// A recording cannot have started longer ago than the longest meeting the bot will sit
+// through, plus slack for the upload drain.
+const MAX_CAPTURE_START_AGE_MS = (config.runner.maxDurationMinutes + 60) * 60 * 1000;
 // Sized for playback rather than for API calls: one viewing of a clip is a burst of Range
 // requests — a probe, the trailing moov read, then one per scrub — so a login-shaped limit
 // here would break the video for a legitimate viewer while barely inconveniencing someone
@@ -1642,7 +1645,15 @@ async function route(request, response) {
     if (meeting.video.status !== "recording") {
       await patchVideo(meeting.id, {
         status: "recording",
-        startedAt: meeting.video.startedAt || new Date().toISOString(),
+        // The worker's capture-start time, not the moment its first bytes arrived here.
+        // A short recording never fills an upload batch, so nothing is sent until the
+        // drain at the end — stamping receipt time made a 42s recording claim it started
+        // 45 seconds after it did. Validated rather than trusted: a runner is
+        // authenticated, but a clock-skewed or malformed value would silently corrupt the
+        // retention anchor, so anything not a sane past timestamp falls back to now.
+        startedAt:
+          meeting.video.startedAt ||
+          sanitizeCaptureStart(url.searchParams.get("startedAt"), { maxAgeMs: MAX_CAPTURE_START_AGE_MS }),
         // Fresh bytes mean a fresh retention window, and patchVideo merges: a purgedAt
         // from a previous recording of this meeting would outlive it and exempt the new
         // one from every sweep.

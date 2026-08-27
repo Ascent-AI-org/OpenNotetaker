@@ -43,7 +43,11 @@ services:
       # (chrome channel, avfoundation, etc.) cannot leak into the Linux container.
       BOT_CHROME_EXECUTABLE_PATH: /usr/bin/chromium
       BOT_CHROME_LAUNCH_MODE: rawcdp
-      BOT_CHROME_EXTRA_ARGS: --no-sandbox --disable-dev-shm-usage
+      # Chrome must fill the display, or x11grab records the desktop around it: the first
+      # production recording spent ~17% of every frame on black border because the window
+      # was ~1060x710 inside a 1280x720 grab. Keep these three in step — XVFB_SCREEN,
+      # VIDEO_SIZE and the window size are one number in three places.
+      BOT_CHROME_EXTRA_ARGS: --no-sandbox --disable-dev-shm-usage --window-size=1280,720 --window-position=0,0 --disable-infobars --test-type
       BOT_HEADLESS: "false"
       FFMPEG_PATH: /usr/bin/ffmpeg
       AUDIO_CAPTURE_DRIVER: pulse
