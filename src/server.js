@@ -238,6 +238,16 @@ sessionSweeper.unref?.();
 
 // The store keeps every meeting in memory and rewrites the whole file on every
 // mutation, so raw transcripts left in place forever eventually OOM the process.
+// Heartbeats were never pruned by anything until the cap in appendEvent, so a store
+// written before it still carries every beat ever emitted. Done here rather than in a
+// script because the running server holds this file in memory and would write its
+// uncapped copy back over any external edit.
+const prunedHeartbeats = await store.pruneStoredHeartbeats().catch((error) => {
+  console.error(error);
+  return 0;
+});
+if (prunedHeartbeats > 0) console.log(`pruned ${prunedHeartbeats} stored heartbeat events`);
+
 // Run once at boot (in case retention lapsed while the server was down) and then
 // hourly, mirroring sessionSweeper above.
 await store.pruneExpiredArtifacts(Date.now(), { isActiveStatus: isActiveJobStatus }).catch((error) => {
@@ -2817,10 +2827,16 @@ function isActiveJobStatus(status) {
 // action-item counts need, drops the transcript arrays that dominate response
 // size. The client (hasFullArtifacts in app.js) treats their absence as "fetch
 // GET /api/meetings/:id for the full transcript" and fills it in on selection.
+// The list payload. `events` is dropped deliberately: the run log is rendered only by the
+// detail view, which fetches the full meeting separately (see ensureMeetingDetail), while
+// the list re-fetched every 1.8s carried every event ever recorded. On this instance that
+// was 6.2MB of a 7.1MB response, 5.8MB of it bot.heartbeat lines the list cannot display.
+// Send the count so the UI can still say a run log exists without shipping it.
 function summarizeMeeting(meeting) {
-  const { artifacts, ...rest } = publicMeeting(meeting);
+  const { artifacts, events, ...rest } = publicMeeting(meeting);
   return {
     ...rest,
+    eventCount: events?.length ?? 0,
     artifacts: {
       notes: artifacts?.notes ?? null,
       reconstructedTranscript: null,
