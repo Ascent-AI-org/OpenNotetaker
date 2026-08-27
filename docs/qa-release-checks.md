@@ -1,13 +1,17 @@
-# QA release checks — multi-account Google, editable action items
+# QA release checks — multi-account Google, editable action items, video recording
 
-Covers two pull requests, reviewed together:
+Covers two pull requests reviewed together, plus the video branch stacked on top:
 
 | PR | What it is | Size |
 |---|---|---|
 | [#7](https://github.com/Ascent-AI-org/OpenNotetaker/pull/7) | Multiple Google accounts, notes to every inbox, editable action items | +2559 / −169, 14 files |
 | [#6](https://github.com/Ascent-AI-org/OpenNotetaker/pull/6) | Fixes silent transcript loss, premature retention purges, weak login rate limiting | +1114 / −46, 17 files |
+| video | Optional meeting video: playback, clips, expiring share links, retention and disk budget | new branch |
 
-**#7 is stacked on #6**, so checking out `feature/multi-google-accounts` gives you both in one branch.
+**#7 is stacked on #6**, so checking out `feature/multi-google-accounts` gives you both in
+one branch. The video work is a separate branch; its checks are **VID** below. Video is
+inert unless an operator sets `VIDEO_RECORDING_ENABLED=true` — VID-01 is the check that it
+stays inert.
 
 Test IDs are stable — file bugs as "AD-03 fails" and everyone knows what you mean.
 Checks marked **[needs Google]** require real OAuth credentials; everything else runs
@@ -27,7 +31,7 @@ cd OpenNotetaker
 git checkout feature/multi-google-accounts
 npm install
 
-# Automated suites — expect 132 passing, 35 modules.
+# Automated suites — read the failure count, not the total.
 npm test
 npm run check
 
@@ -48,7 +52,9 @@ action items.
 
 - [ ] **SET-01 — Test suite passes on a clean checkout**
   - **Do:** `npm test` and `npm run check`.
-  - **Expect:** 132 tests passing, 0 failing; 35 modules parsed cleanly.
+  - **Expect:** All tests passing, 0 failing; every module parsed cleanly. The counts
+    move as branches land — 132 tests over 35 modules before video, more after it — so
+    read the failure count, not the total.
 - [ ] **SET-02 — Demo meeting completes and produces action items**
   - **Do:** Create a meeting, press Record, wait.
   - **Expect:** Status reaches "Notes ready"; the Action items table shows rows with
@@ -361,6 +367,136 @@ one failed silently before — nothing in the UI told you it had gone wrong.
 
 ---
 
+## VID — Video recording
+
+Optional, off by default, and additive: the transcript is the product and video must never
+be able to cost you one. Everything in this section is written from that rule — a video
+that fails, fills the disk, or is purged has to leave the transcript, the notes, and the
+action items exactly as they would have been.
+
+Turn it on for testing with a small budget, so eviction is reachable in one session rather
+than next month:
+
+```bash
+DATA_DIR=/tmp/ont-qa BOT_PROVIDER=demo LLM_PROVIDER=mock \
+  VIDEO_RECORDING_ENABLED=true VIDEO_RETENTION_DAYS=1 \
+  VIDEO_DISK_BUDGET_GB=1 VIDEO_SHARE_DEFAULT_DAYS=1 npm run dev
+```
+
+> **Real recordings need docker.** Demo mode produces meetings and video records, but the
+> actual x11grab capture only happens inside the worker container. VID-05, VID-06 and
+> VID-12 are worth doing against `docker compose up -d` with a real Meet call; the rest
+> can be done in demo mode.
+
+- [ ] **VID-01 — Upgrading does not silently start recording** 🔴 *blocker if it fails*
+  - **Do:** Start the branch against an existing `$DATA_DIR` with no `VIDEO_*` variables
+    set at all. Record a meeting.
+  - **Expect:** No player, no video controls, nothing written under `$DATA_DIR/media/`.
+    An existing deployment that upgrades must not start recording faces because someone
+    merged a branch.
+- [ ] **VID-02 — Once enabled, meetings record unless unticked**
+  - **Do:** With `VIDEO_RECORDING_ENABLED=true`, create one meeting leaving the recording
+    box alone, and a second with it unticked. Run both.
+  - **Expect:** The first finishes with video. The second finishes with transcript, notes
+    and action items and *no* video — status `skipped`, not `failed`. The choice survives
+    a page reload made before recording starts.
+- [ ] **VID-03 — The recording appears and plays**
+  - **Do:** Open a finished meeting with video and press play.
+  - **Expect:** Picture and audio, and a duration within a few seconds of the meeting's.
+    The file exists under `$DATA_DIR/media/`, and the response is `video/mp4` with
+    `Accept-Ranges: bytes`.
+- [ ] **VID-04 — Seeking works** 🟠 *looks fine until you drag the scrubber*
+  - **Do:** Drag to the middle of a recording longer than a few minutes, then near the
+    end, then back to the start. Then from the command line, with your session cookie:
+    ```
+    curl -i -H 'Range: bytes=1000-2000'  <video url>
+    curl -i -H 'Range: bytes=-500'       <video url>
+    curl -i -H 'Range: bytes=99999999-'  <video url>
+    ```
+  - **Expect:** Playback jumps at each drag instead of restarting or freezing. The first
+    two return `206 Partial Content` with a correct `Content-Range` and exactly 1001 and
+    500 bytes. The third returns `416`. A `200` with the whole body is the bug — a short
+    demo clip plays fine that way, so this only ever shows up as an un-draggable
+    scrubber on a real hour-long meeting.
+- [ ] **VID-05 — A killed worker still leaves a playable recording** 🔴 *data loss*
+  - **Do:** Start a real recording, let it run a couple of minutes, then
+    `docker compose kill open-notetaker-worker`.
+  - **Expect:** The meeting still finishes with notes salvaged from the segments already
+    flushed, *and* the partial video plays up to roughly where the worker died. A
+    zero-byte file, or one the browser refuses to open, is a failure — the chunks that
+    arrived were already on the app's disk.
+- [ ] **VID-06 — A video failure never touches the transcript** 🔴 *blocker if it fails*
+  - **Do:** Break capture on purpose — point `VIDEO_CAPTURE_SOURCE` at a display that
+    does not exist (`:77`) — and record a real meeting.
+  - **Expect:** The meeting runs its normal length and finishes with transcript, notes and
+    action items. Video is marked `failed` with a reason in the run log. The meeting must
+    not end early, lose segments, or fail. If the recording is shortened by the video
+    process dying, that is the one bug this whole feature is not allowed to have.
+- [ ] **VID-07 — Clips cut where you asked**
+  - **Do:** Cut a clip from 02:00 to 02:30. Cut another straight from an action item.
+    Then try `endMs` before `startMs`, a range past the end of the recording, and one
+    longer than `VIDEO_MAX_CLIP_SECONDS`.
+  - **Expect:** 30 seconds, starting on the frame you picked rather than the nearest
+    keyframe a second earlier. The clip is listed with its label, plays, and seeks. The
+    three bad ranges are each rejected with a message naming the problem — not saved, and
+    not silently clamped.
+- [ ] **VID-08 — A share link is shown once and is never recoverable** 🔴 *security*
+  - **Do:** Create a share link on a clip, copy it, close the dialog, reopen it. Then
+    grep the store for the token you copied — `grep -c '<token>' $DATA_DIR/meetings.json`
+    — and in DevTools search every API response for `tokenHash`.
+  - **Expect:** The URL is displayed exactly once; afterwards the UI offers **Regenerate**,
+    never "copy again". The raw token appears nowhere in `meetings.json` — only a hash —
+    and `tokenHash` appears in no API response at all. Someone who steals the store must
+    not walk away with working video links.
+- [ ] **VID-09 — A public link behaves like a public link**
+  - **Do:** Open the link in a private window with no session, and `curl -I` it.
+  - **Expect:** The clip plays for someone with no account, with Range working. Headers
+    carry `X-Robots-Tag: noindex, nofollow`, `Referrer-Policy: no-referrer`,
+    `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`. The link
+    reaches that one clip and nothing else — no route from it to the full recording, the
+    transcript, or the meeting page. Requesting it in a tight loop from one IP starts
+    being rate limited.
+- [ ] **VID-10 — Expiry and revoke actually close the door** 🔴 *security*
+  - **Do:** Create a link, view it a couple of times, then hand-edit its `expiresAt` in
+    `meetings.json` to the past and restart. Separately, create a second link and press
+    **Revoke**. Open both.
+  - **Expect:** `404` on each — never `403`, and never an "expired" page, both of which
+    confirm the clip exists. The view count reflected the real views taken before expiry.
+- [ ] **VID-11 — Retention purge removes the bytes and kills live links** 🔴 *security*
+  - **Do:** With `VIDEO_RETENTION_DAYS=1`, take a finished meeting that has a clip with a
+    live share link, hand-edit the video's `capturedAt` to three days ago, restart, and
+    let the hourly sweep run.
+  - **Expect:** `du -sh $DATA_DIR/media/` shows the files actually gone, not just hidden;
+    video status reads `purged`; the share link that worked a minute ago now `404`s. The
+    meeting, its notes and its transcript are untouched.
+  - **Then check the other direction:** set a meeting's own `retentionDays` *below*
+    `VIDEO_RETENTION_DAYS` and age it. The video must go no later than the transcript.
+    Video outliving the transcript it belongs to is a release blocker.
+- [ ] **VID-12 — The disk budget evicts oldest first**
+  - **Do:** Set `VIDEO_DISK_BUDGET_GB` just above current usage of `$DATA_DIR/media/` and
+    record until it is exceeded. Separately, fill the volume so less than
+    `VIDEO_MIN_FREE_DISK_GB` is free, then record.
+  - **Expect:** The *oldest* recording is evicted first and the newest is kept, usage
+    drops back under budget, and an event says what went and why. Under the free-space
+    floor a meeting records audio and transcript and skips video with a reason — it must
+    never keep writing until the disk is full, because at that point `meetings.json`
+    cannot be rewritten either and transcription goes down with it.
+- [ ] **VID-13 — Another user cannot reach your video** 🔴 *security*
+  - **Do:** As user B, with user A's ids:
+    ```
+    GET    /api/meetings/<A id>/video
+    POST   /api/meetings/<A id>/clips
+    GET    /api/meetings/<A id>/clips/<A clip id>
+    DELETE /api/meetings/<A id>/clips/<A clip id>
+    POST   /api/meetings/<A id>/clips/<A clip id>/share
+    ```
+    Then try a crafted id: `../../users.json` and its encoded form `%2e%2e%2f`.
+  - **Expect:** `404` on every one and not a byte of video — never `403`, same rule as
+    SEC-01. The crafted ids are rejected outright; no request may resolve to a path
+    outside the media directory.
+
+---
+
 ## What has not been verified
 
 Stated plainly so QA knows where to spend its time. Everything below is untested by the
@@ -380,7 +516,16 @@ author and needs a human with real credentials.
   needed" message appears for the right account.
 - **Any real recording.** All pipeline testing used demo mode. Nothing here exercises
   Chrome, PulseAudio, Deepgram, or an actual Meet call.
-- **Browsers other than Chrome.** UI verification ran in Chrome only.
+- **Browsers other than Chrome.** UI verification ran in Chrome only — and video is the
+  part where that matters most, since Safari is strict about Range responses and will
+  refuse to play a file Chrome tolerates. VID-03 and VID-04 in Safari are the highest-value
+  browser checks in this document.
+- **Real screen capture.** x11grab was exercised against a virtual display, never against
+  a live Meet call with several participants and a screen share. File sizes, CPU cost
+  alongside audio capture, and whether 15fps at CRF 30 is actually readable when someone
+  shares code are all unmeasured.
+- **Disk pressure.** Eviction and the free-space floor were tested with hand-set budgets
+  on a mostly empty disk, not by genuinely filling a volume.
 
 ---
 

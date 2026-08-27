@@ -4,12 +4,13 @@ The external runner is the path from demo mode to a real unattended Google Meet 
 
 For the Docker/VM deployment path, see [docker-vm.md](docker-vm.md). That path uses Linux PulseAudio loopback inside the container and does not require macOS BlackHole or a Mac restart.
 
-It does four things:
+It does four things, plus one optional fifth:
 
 1. Opens Google Meet in Chrome.
 2. Joins as a visible participant, ideally named `OpenNotetaker - Recording`.
 3. Captures system audio through `ffmpeg`.
 4. Streams audio to Deepgram, then submits raw transcript segments back to the web app for English cleanup and notes.
+5. Optionally captures the screen through a second `ffmpeg` and uploads the video in chunks (see "Video capture").
 
 ## Two runner modes
 
@@ -24,6 +25,8 @@ PATCH /api/runner/meetings/:id
 POST  /api/runner/meetings/:id/events
 POST  /api/runner/meetings/:id/segments          (incremental flush, id-deduped)
 POST  /api/runner/meetings/:id/raw-transcript
+POST  /api/runner/meetings/:id/video?offset=N     (video only, resumable chunks)
+POST  /api/runner/meetings/:id/video/finalize     (video only)
 ```
 
 `RUNNER_TOKEN` is required in external and fleet modes. Treat it like a secret.
@@ -120,6 +123,26 @@ AUDIO_CAPTURE_SOURCE=:<loopback-index>
 
 If the selected device is `MacBook Pro Microphone` or another physical microphone, preflight will warn because Deepgram may receive silence, room echo, or the wrong speaker mix.
 
+## Video capture
+
+Off unless the operator sets `VIDEO_RECORDING_ENABLED=true` on the web app; the runner is told per meeting whether to record. When it is on:
+
+```bash
+VIDEO_CAPTURE_DRIVER=x11grab     # macOS: avfoundation with a screen-capture index
+VIDEO_CAPTURE_SOURCE=:99         # the display Chrome is drawing on
+VIDEO_SIZE=1280x720              # must match that display, or you record bars/crop
+VIDEO_FRAMERATE=15
+VIDEO_CRF=30
+VIDEO_PRESET=veryfast
+```
+
+Two rules the runner is built around, both worth preserving in any change here:
+
+- **Video capture is a separate `ffmpeg` process from the audio one, and its exit is never raced into the end of the meeting.** A crashed, stalled, or never-started capture posts an event, marks the meeting's video failed, and the recording finishes on audio alone. Anything that lets a video failure shorten or fail a meeting is a bug in the thing the runner exists to do.
+- **The worker never writes video to a volume it owns.** Bytes go to the app in chunks at `POST /api/runner/meetings/:id/video?offset=N`, where the offset is the byte position the chunk starts at. The server replies `409 {"error":"offset_gap","expected":N}` if a chunk arrives out of order, so a retried or resumed upload re-sends from `expected` rather than corrupting the file; a chunk that was already applied is acknowledged as a duplicate. `finalize` remuxes the file on the app side.
+
+In docker compose the capture driver, source, and size are pinned on the worker service, because a `.env` written on a Mac says `avfoundation` and would grab nothing inside the Linux container.
+
 ## Running manually
 
 With the web server running and a meeting already created:
@@ -133,4 +156,4 @@ In normal external mode, the web app spawns this command for you when you click 
 
 ## Consent and retention
 
-The bot must be visible in the participant list and should only run when the meeting host has authority to record or all participants have consented. Meeting audio and transcripts are personal data. Before external users rely on this, add account auth, workspace scoping, encrypted storage, deletion jobs, processor records, and audit logs.
+The bot must be visible in the participant list and should only run when the meeting host has authority to record or all participants have consented. Meeting audio and transcripts are personal data, and video of participants' faces is more of it — which is why video is off until an operator turns it on, and why a recording is purged under the tighter of `VIDEO_RETENTION_DAYS` and the meeting's own retention, never outliving the transcript it belongs to. Before external users rely on this, add account auth, workspace scoping, encrypted storage, deletion jobs, processor records, and audit logs.
