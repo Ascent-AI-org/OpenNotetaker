@@ -120,14 +120,35 @@ export class JsonStore {
     const meeting = this.getMeeting(id);
     if (!meeting) return null;
     return this.updateMeeting(id, {
-      events: [
+      events: capHeartbeats([
         ...meeting.events,
         {
           at: new Date().toISOString(),
           ...event
         }
-      ]
+      ])
     });
+  }
+
+  // Applies the heartbeat cap to events already on disk. appendEvent only caps what it
+  // writes, so without this the beats accumulated before the cap existed would stay
+  // forever — on this instance that was 49,981 of 52,575 events. Runs at boot, before the
+  // server serves traffic: a standalone script could not do this safely, because the
+  // running server holds the whole store in memory and the next persist() would write the
+  // uncapped copy straight back over it. Idempotent, so booting twice is harmless.
+  async pruneStoredHeartbeats() {
+    let removed = 0;
+    for (const meeting of this.state.meetings) {
+      const before = meeting.events?.length || 0;
+      if (!before) continue;
+      const capped = capHeartbeats(meeting.events);
+      if (capped.length === before) continue;
+      meeting.events = capped;
+      removed += before - capped.length;
+    }
+    // One persist for the whole pass, not one per meeting: this file is tens of megabytes.
+    if (removed > 0) await this.persist();
+    return removed;
   }
 
   // Clears the raw/normalized transcript once the transcript itself is past the
@@ -175,12 +196,45 @@ export class JsonStore {
     const write = this.writeQueue.catch(() => {}).then(async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
       const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-      await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, "utf8");
+      // Compact, not pretty-printed. Indentation cost 34MB of the 83MB written on EVERY
+      // persist() — and this file is read by JSON.parse and by node one-liners, never by
+      // eye at this size.
+      await writeFile(tempPath, `${JSON.stringify(this.state)}\n`, "utf8");
       await rename(tempPath, this.filePath);
     });
     this.writeQueue = write;
     return write;
   }
+}
+
+// bot.heartbeat is a liveness signal, not a record. One lands every few seconds of every
+// recording and nothing ever removed them: pruneExpiredArtifacts clears transcripts but has
+// never touched events, so heartbeats outlived even the meetings whose transcripts were
+// purged. They reached 49,981 of 52,575 stored events and 5.8MB of the meeting-list payload
+// before this cap existed. Keep a short tail — enough to see a recording is progressing —
+// and drop the rest. Other event types are an audit trail and are never dropped.
+const HEARTBEAT_TYPE = "bot.heartbeat";
+const HEARTBEAT_KEEP = 20;
+
+export function capHeartbeats(events, keep = HEARTBEAT_KEEP) {
+  const list = Array.isArray(events) ? events : [];
+  let seen = 0;
+  for (const event of list) {
+    if (event?.type === HEARTBEAT_TYPE) seen += 1;
+  }
+  if (seen <= keep) return list;
+
+  // Drop the OLDEST heartbeats: the recent ones are the ones that answer "is it alive".
+  let toDrop = seen - keep;
+  const kept = [];
+  for (const event of list) {
+    if (event?.type === HEARTBEAT_TYPE && toDrop > 0) {
+      toDrop -= 1;
+      continue;
+    }
+    kept.push(event);
+  }
+  return kept;
 }
 
 // When the retention clock starts for a meeting's transcript. Prefer the moment the
