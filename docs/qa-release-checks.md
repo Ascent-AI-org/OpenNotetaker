@@ -254,6 +254,77 @@ this lives.
 
 ---
 
+## NC — Composing and sending meeting notes
+
+The full meeting notes editor—not just action items. Press **Compose & send** on any
+finished meeting, pick a template (Full record or Client-safe), edit anything, compose
+for specific recipients, preview the exact email, then send. Edits exist only for this
+send and never touch the stored meeting record.
+
+> **The rules this section exists to protect**
+>
+> Edits to the notes, transcript, or sections are per-send only — they never modify
+> what is stored. A deselected transcript turn is genuinely absent from the delivered
+> email. Raw evidence and transcript are subject to a specific redaction rule: if any
+> transcript turn is deselected, raw evidence is disabled (the UI enforces this; the
+> API does not). An external recipient must be confirmed before sending — the server
+> enforces this, not just the UI. If QA finds any path where the stored record is
+> modified, or where a deselected turn appears in the email, or where an unconfirmed
+> external send succeeds, that is a release blocker.
+
+- [ ] **NC-01 — Preview output matches the delivered email** 🔴 *blocker if it fails*
+  - **Do:** Open Compose & send, choose a template, make edits to sections and turns,
+    then press **Preview**. Note the exact output. Then press **Send now** to a real
+    address and open the inbox.
+  - **Expect:** The email in the inbox is pixel-for-pixel identical to the preview —
+    same sections, same edited turn text, same section order. The preview and send use
+    the same renderer so they cannot drift.
+- [ ] **NC-02 — A deselected transcript turn is absent from the sent email** 🔴 *blocker if it fails*
+  - **Do:** In Compose & send, open the transcript, deselect at least one turn, then
+    send to yourself and open the inbox.
+  - **Expect:** The deselected turn does not appear in the email. Every unchecked turn
+    is genuinely absent, not hidden by CSS or truncated by a preview.
+- [ ] **NC-03 — Edits to turns arrive but the stored transcript is unchanged** 🔴 *data loss if it fails*
+  - **Do:** In Compose & send, edit the text of a transcript turn (change a word or
+    two), send, verify the email shows the edit. Then reload the meeting.
+  - **Expect:** The email contains your edited text. The meeting's stored transcript is
+    exactly unchanged — when you reload, the turn text is back to the original. No
+    permanent change has been made.
+- [ ] **NC-04 — An external recipient is refused until confirmed** 🔴 *blocker if it fails*
+  - **Do:** In Compose & send, type an address on a different domain (e.g. if your
+    connected domains are @company.com, type anything@external.org), then press **Send
+    now** without confirming the warning.
+  - **Expect:** A confirmation dialog appears *before* the send, naming that address and
+    asking you to confirm. Pressing cancel sends nothing. Confirming the warning makes
+    the send go through.
+- [ ] **NC-05 — Section toggles control what is sent**
+  - **Do:** Compose & send, toggle off summary, decisions, and risks. Leave on action
+    items and transcript only. Send and open the inbox.
+  - **Expect:** The email contains only action items and transcript, in that order. No
+    summary, decisions, or risks appear.
+- [ ] **NC-06 — notes.email_sent appears in the run log with recipients**
+  - **Do:** Compose & send a meeting to two recipients, then expand the run log at the
+    bottom.
+  - **Expect:** An entry reads "Notes emailed to: *recipient1*, *recipient2*" (or similar
+    phrasing). The run log names both recipients.
+- [ ] **NC-07 — Raw evidence is disabled when any turn is deselected** 🔴 *redaction trap*
+  - **Do:** In Compose & send with raw evidence enabled, deselect one transcript turn.
+  - **Expect:** The raw evidence checkbox is disabled and grayed out. Toggling a turn
+    back on re-enables it. The UI prevents the redaction trap where a deselected turn's
+    text would leak into raw evidence.
+- [ ] **NC-08 — Client-safe preset omits internal sections**
+  - **Do:** Compose & send, pick the **Client-safe** template.
+  - **Expect:** Summary, decisions, and action items are on. Detailed notes, open
+    questions, risks, transcript, and raw evidence are off by default. The preset
+    matches the documented "summary, decisions, action items only" list.
+- [ ] **NC-09 — A non-owner gets 404 on the notes endpoint** 🔴 *access control if it fails*
+  - **Do:** As user B, call `POST /api/meetings/<user A meeting id>/send-notes` with a
+    valid body.
+  - **Expect:** `404` — never `403`, never "forbidden". The meeting's existence does not
+    leak.
+
+---
+
 ## MG — Upgrade path for existing installs
 
 Anyone already running OpenNotetaker has a single Google connection stored the old way.
