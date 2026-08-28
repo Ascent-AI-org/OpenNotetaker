@@ -2418,6 +2418,24 @@ details.section-fold > .fold-body {
    dialog painted after close() had already set open=false. It looked like Close was
    broken; the dialog was shut and still on screen. Every other dialog here avoids this by
    never declaring display at all (see .dialog), so add layout under [open] or not at all. */
+/* Outside .compose-body on purpose. It used to live at the end of that scroller, after
+   the transcript section — so on a 1,746-turn meeting a failed send rendered its message
+   and its Confirm & continue button roughly 1,746 rows below the fold. The send looked
+   like it did nothing. Anything the operator must act on belongs next to the buttons they
+   are already looking at, not at the bottom of a list. */
+.compose-error-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 10px;
+}
+
+.compose-error-row:has(#compose-error:empty):has(#compose-confirm-external[hidden]) {
+  display: none;
+}
+
 .dialog-compose[open] {
   display: flex;
   flex-direction: column;
