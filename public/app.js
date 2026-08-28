@@ -81,14 +81,27 @@ const composerState = {
   error: "",
   needsExternalConfirm: false,
   pendingPreview: false, // which action the external-confirm retry should repeat
-  inFlight: null, // null | "preview" | "send" — drives button labels, not a network guard by itself
-  busy: false
+  inFlight: null, // null | "preview" | "send" — drives button labels
+  // busy + activeRequestId together are the actual duplicate-send guard: busy blocks a
+  // second click while a request is outstanding, and activeRequestId is what stops a
+  // response that arrives after the dialog has moved on (closed and reopened, or sent
+  // again for the same or a different meeting) from releasing that guard early. A plain
+  // meetingId comparison isn't enough on its own — a second send for the SAME meeting
+  // would share it with the first — so this is a token, minted fresh per submitCompose
+  // call (see composeRequestSeq), not a meeting identity.
+  busy: false,
+  activeRequestId: 0
 };
 
 const PRESETS = {
   full: { summary: true, decisions: true, actionItems: true, openQuestions: true, risks: true, transcript: true, rawEvidence: true },
   clientSafe: { summary: true, decisions: true, actionItems: true, openQuestions: false, risks: false, transcript: false, rawEvidence: false }
 };
+
+// Source of the token above. Module-level (not composerState) because it must keep
+// counting across dialog opens/closes — resetting it on open would let a request from a
+// PRIOR session collide with request #1 of a new one.
+let composeRequestSeq = 0;
 
 // Transcript rows are built once per dialog open and mutated in place (see
 // buildComposeTurnList); a 685-turn meeting is thousands of DOM nodes, cheap to build
@@ -2964,6 +2977,13 @@ async function submitCompose(preview) {
   }
 
   const meetingId = composerState.meetingId;
+  // Minted fresh for this call and never reused — see the comment on composerState's
+  // activeRequestId. Whoever holds the matching id when the response comes back is the
+  // request the dialog is still waiting on; anyone else's response is stale and must not
+  // touch the dialog, even though it still has to finish the meeting-scoped bookkeeping
+  // below (reloadMeeting, sendingEmails) that isn't about the dialog at all.
+  const requestId = ++composeRequestSeq;
+  composerState.activeRequestId = requestId;
   composerState.busy = true;
   composerState.inFlight = preview ? "preview" : "send";
   composerState.error = "";
@@ -2980,23 +3000,40 @@ async function submitCompose(preview) {
 
   try {
     const body = await callNotesEmail(meetingId, buildComposePayload(), { preview });
+    const isCurrentRequest = composerState.activeRequestId === requestId;
     if (preview) {
-      composePreviewSubject.textContent = body.subject ? `Subject: ${body.subject}` : "";
-      composePreviewFrame.srcdoc = body.html || "";
-      composePreviewGroup.hidden = false;
-      composePreviewGroup.scrollIntoView({ block: "nearest", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+      // A stale preview response must not overwrite what is now a different (or newer)
+      // send's preview pane.
+      if (isCurrentRequest) {
+        composePreviewSubject.textContent = body.subject ? `Subject: ${body.subject}` : "";
+        composePreviewFrame.srcdoc = body.html || "";
+        composePreviewGroup.hidden = false;
+        composePreviewGroup.scrollIntoView({ block: "nearest", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+      }
     } else {
-      composeDialog.close();
+      // A stale send response must not close a dialog that has since moved on to a
+      // different composition — that send may still be genuinely in flight.
+      if (isCurrentRequest) composeDialog.close();
+      // Unconditional either way: this send genuinely happened (or failed) for
+      // meetingId, and that is true regardless of what the dialog is doing now.
       await reloadMeeting(meetingId);
     }
   } catch (error) {
-    composerState.error = error.message;
-    composerState.needsExternalConfirm = error.code === "external_not_confirmed";
-    composerState.pendingPreview = preview;
-    renderComposeError();
+    if (composerState.activeRequestId === requestId) {
+      composerState.error = error.message;
+      composerState.needsExternalConfirm = error.code === "external_not_confirmed";
+      composerState.pendingPreview = preview;
+      renderComposeError();
+    }
   } finally {
-    composerState.busy = false;
-    composerState.inFlight = null;
+    // The actual fix for the duplicate-send race: only the request the dialog is still
+    // waiting on may release the busy guard. A meetingId check alone isn't enough here —
+    // a second send of the SAME meeting would share it with the first — which is why
+    // this compares the per-call token instead.
+    if (composerState.activeRequestId === requestId) {
+      composerState.busy = false;
+      composerState.inFlight = null;
+    }
     if (!preview) {
       state.sendingEmails.delete(meetingId);
       renderCache.detail = "";
