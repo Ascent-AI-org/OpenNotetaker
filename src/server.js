@@ -79,7 +79,7 @@ import {
 } from "./domain/export.js";
 import { buildTranscriptEmail } from "./domain/transcript-email.js";
 import { parseNotesEmailSelection } from "./domain/notes-email-selection.js";
-import { renderNotesEmail } from "./domain/notes-email-render.js";
+import { renderNotesEmail, selectedTranscriptTurns } from "./domain/notes-email-render.js";
 import {
   CALENDAR_READONLY_SCOPE,
   GMAIL_SEND_SCOPE,
@@ -1235,41 +1235,63 @@ async function route(request, response) {
       }
     }
 
-    // Nothing delivered: there is nothing to audit as "sent", so this is reported as a
-    // failure rather than recorded on the meeting. The events log (below, on the success
-    // path) is where a delivery attempt's outcome belongs; a wholly failed attempt has no
-    // delivery to describe.
+    // Nothing delivered: there is nothing to audit as "sent", so no delivery record is
+    // written — but the attempt itself must not vanish. Without this event, someone
+    // reading the meeting's history a moment later would see no trace that a send was
+    // ever tried, exactly like transcript.email_failed / action_items.email_failed
+    // already leave one for their own total failures.
     if (!providerMessageIds.length) {
+      const failureDetail = failedRecipients.map((entry) => `${entry.recipient} (${entry.error})`).join(", ");
+      await store.appendEvent(meeting.id, {
+        type: "notes.email_failed",
+        message: `Notes email failed for ${failureDetail}.`
+      });
       return sendJson(response, 400, {
         error: "email_failed",
-        message: `Notes email failed for ${failedRecipients.map((entry) => entry.recipient).join(", ")}.`,
+        message: `Notes email failed for ${failureDetail}.`,
         failedRecipients
       });
     }
 
+    // Re-read immediately before merging rather than reusing the `meeting` captured at
+    // handler entry: the send loop above just spent one network round-trip per recipient,
+    // and store.updateMeeting only deep-merges `artifacts` — `delivery` is replaced
+    // wholesale. Merging against the stale copy would silently drop a delivery.* entry
+    // written by a concurrent action-items or transcript send that landed in that window.
+    // updateTranscriptEmailDelivery / updateActionItemsDelivery re-read for the same
+    // reason.
+    const current = store.getMeeting(meeting.id);
     // Partial success is still a send: the delivered copies cannot be unsent, and
     // failedRecipients records exactly who still needs one — the same call the
-    // action-items sender already makes.
+    // action-items sender already makes. recipients here is the full attempted list (who
+    // this send was addressed to); the event message below names only who it actually
+    // reached, so "sent to" cannot overstate a partial failure.
     const updated = await store.updateMeeting(meeting.id, {
       delivery: {
-        ...(meeting.delivery || {}),
+        ...(current?.delivery || {}),
         notesEmail: {
           sentAt: new Date().toISOString(),
           recipients: parsed.value.recipients,
           subject: rendered.subject,
           sections: parsed.value.sections,
-          turnsSent: parsed.value.transcript.includeIds.length,
+          // Deduped by which segments actually ended up in the rendered email, not the
+          // raw includeIds count — a repeated id in the request must not inflate the
+          // audit count above what the recipient actually received.
+          turnsSent: selectedTranscriptTurns(meeting, parsed.value).length,
           turnsEdited: Object.keys(parsed.value.transcript.edits).length,
           providerMessageIds,
           failedRecipients
         }
       }
     });
+    const sentTo = providerMessageIds.map((entry) => entry.recipient).join(", ");
+    const sentSections = Object.entries(parsed.value.sections).filter(([, on]) => on).map(([key]) => key).join(", ") || "no sections";
+    const failedClause = failedRecipients.length
+      ? ` (failed for ${failedRecipients.map((entry) => entry.recipient).join(", ")})`
+      : "";
     await store.appendEvent(meeting.id, {
       type: "notes.email_sent",
-      message:
-        `Notes sent to ${parsed.value.recipients.join(", ")} ` +
-        `(${Object.entries(parsed.value.sections).filter(([, on]) => on).map(([key]) => key).join(", ") || "no sections"}).`
+      message: `Notes sent to ${sentTo} (${sentSections})${failedClause}.`
     });
     return sendJson(response, 200, {
       meeting: publicMeeting(updated),
