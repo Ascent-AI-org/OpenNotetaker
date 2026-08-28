@@ -1,3 +1,7 @@
+// Pure logic pulled out so it is testable without a DOM — see the comment there for why
+// it lives in its own file instead of just being a function in this one.
+import { canEnableRawEvidence } from "./compose-guard.js";
+
 const state = {
   user: null,
   authMode: "login",
@@ -2743,11 +2747,15 @@ function handleComposeSectionChange(event) {
 // Ruling 4 (2026-08-27-notes-email-composer progress ledger): the renderer sends raw
 // evidence as every raw segment, unfiltered by which turns are selected. Left as-is
 // server-side — this dialog is where the combination gets closed off instead: raw
-// evidence is disabled outright the moment any turn is deselected, so a redacted turn
-// cannot leak out through a section that ignores the redaction entirely.
+// evidence is disabled outright unless canEnableRawEvidence says the selection could not
+// possibly diverge from it.
+//
+// That covers deselecting a turn AND editing one — editing is redaction too (see
+// compose-guard.js), so this must run after every mutation to either includeIds or
+// edits, not just includeIds. handleComposeTurnTextBlur is the one call site that
+// touches edits without also touching includeIds.
 function syncRawEvidenceGuard() {
-  const allIncluded =
-    composeSegments.length === 0 || composeSegments.every((segment) => composerState.includeIds.has(segment.id));
+  const allIncluded = canEnableRawEvidence(composeSegments, composerState.includeIds, composerState.edits);
   composeRawEvidenceInput.disabled = !allIncluded;
   composeRawEvidenceChoice.classList.toggle("is-disabled", !allIncluded);
   if (!allIncluded && composerState.sections.rawEvidence) {
@@ -2756,7 +2764,7 @@ function syncRawEvidenceGuard() {
   }
   composeRawEvidenceHint.textContent = allIncluded
     ? "Sends every raw segment verbatim — it ignores the turn selection below entirely."
-    : "Off while any turn below is deselected: raw evidence ignores that selection, so it would still include a turn you just redacted.";
+    : "Off while any turn below is deselected or edited: raw evidence ignores both, so it would still include a turn you just redacted.";
   composeRawEvidenceHint.classList.toggle("is-warning", !allIncluded);
 }
 
@@ -2903,6 +2911,12 @@ function handleComposeTurnTextBlur(event) {
     composerState.edits.set(id, edited);
     row?.root.classList.add("is-edited");
   }
+  // This edit just changed composerState.edits without touching includeIds — the one
+  // mutation this dialog makes that the other five (checkbox, preset, select-all/none,
+  // drop-before/after) don't. Raw evidence has to react to an edit exactly as it reacts
+  // to deselection, or "[redacted]" in the transcript ships alongside the original
+  // sentence in raw evidence.
+  syncRawEvidenceGuard();
 }
 
 /* ---- Preview and send ---- */
