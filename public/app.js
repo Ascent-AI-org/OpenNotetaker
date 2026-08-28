@@ -227,6 +227,8 @@ const composeSubjectInput = $("#compose-subject");
 const composeIntroInput = $("#compose-intro");
 const composeSignoffInput = $("#compose-signoff");
 const composeTranscriptCount = $("#compose-transcript-count");
+const composeTranscriptOff = $("#compose-transcript-off");
+const composeEnableTranscript = $("#compose-enable-transcript");
 const composeAllButton = $("#compose-turns-all");
 const composeNoneButton = $("#compose-turns-none");
 const composeDropBeforeButton = $("#compose-turns-drop-before");
@@ -327,6 +329,12 @@ clipEndInput.addEventListener("input", renderClipLengthHint);
 // Compose dialog: Send lives on the form's submit (Enter in Subject works like every
 // other single-line field here); Preview is a plain button so it never doubles as Enter.
 composeForm.addEventListener("submit", handleComposeSubmit);
+composeEnableTranscript.addEventListener("click", () => {
+  composerState.sections.transcript = true;
+  clearComposePresetMatch();
+  renderComposeSections();
+  updateComposeTurnCount();
+});
 composePreviewButton.addEventListener("click", () => void submitCompose(true));
 composeConfirmExternalButton.addEventListener("click", handleComposeConfirmExternal);
 composeRecipientInput.addEventListener("keydown", handleComposeRecipientKeydown);
@@ -2742,6 +2750,8 @@ function handleComposeSectionChange(event) {
   if (!input) return;
   composerState.sections[input.dataset.section] = input.checked;
   clearComposePresetMatch();
+  // The warning below the picker is about THIS checkbox, so it has to re-evaluate here.
+  updateComposeTurnCount();
 }
 
 // Ruling 4 (2026-08-27-notes-email-composer progress ledger): the renderer sends raw
@@ -2821,6 +2831,16 @@ function updateComposeTurnCount() {
   composeTranscriptCount.textContent = composeSegments.length
     ? `${composerState.includeIds.size} of ${composeSegments.length} selected`
     : "No transcript available";
+
+  // Picking turns and editing them are only meaningful if the Transcript SECTION is on,
+  // and the two controls sit far apart — the checkbox is above the fold, the picker is
+  // below a list that can run to 1,746 rows. Someone selected every turn, edited one, sent,
+  // and got an email with no transcript in it: the payload was right, the dialog just never
+  // said the work was being discarded. Deliberately not auto-enabling the section — this
+  // feature exists to stop things being sent that nobody chose to send, so the safe default
+  // is to say so and let the operator decide.
+  const hasTurnWork = composerState.includeIds.size > 0 || composerState.edits.size > 0;
+  composeTranscriptOff.hidden = !(hasTurnWork && !composerState.sections.transcript);
 }
 
 function handleComposeTurnCheckboxChange(event) {
@@ -2911,6 +2931,9 @@ function handleComposeTurnTextBlur(event) {
     composerState.edits.set(id, edited);
     row?.root.classList.add("is-edited");
   }
+  // An edit is turn work in its own right: it can raise the "section is off" warning with
+  // nothing selected at all, so the count/warning has to re-evaluate on this path too.
+  updateComposeTurnCount();
   // This edit just changed composerState.edits without touching includeIds — the one
   // mutation this dialog makes that the other five (checkbox, preset, select-all/none,
   // drop-before/after) don't. Raw evidence has to react to an edit exactly as it reacts

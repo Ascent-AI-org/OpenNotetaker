@@ -2423,6 +2423,19 @@ details.section-fold > .fold-body {
    and its Confirm & continue button roughly 1,746 rows below the fold. The send looked
    like it did nothing. Anything the operator must act on belongs next to the buttons they
    are already looking at, not at the bottom of a list. */
+.compose-transcript-off {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-radius: var(--r-control);
+  background: var(--amber-soft, rgba(180, 120, 20, 0.10));
+  color: var(--amber-ink, #8a5a00);
+  font-size: 12px;
+}
+
 .compose-error-row {
   flex: 0 0 auto;
   display: flex;
