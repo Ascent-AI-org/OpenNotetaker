@@ -82,6 +82,11 @@ test("clamps every free-text field at its documented cap", () => {
   assert.equal(r.value.intro.length, SELECTION_LIMITS.intro);
   assert.equal(r.value.signoff.length, SELECTION_LIMITS.signoff);
   assert.equal(r.value.summaryOverride.length, SELECTION_LIMITS.summary);
+  // Pin the literal cap values from the spec, so a regression in the constant does not pass silently.
+  assert.equal(r.value.subject.length, 200);
+  assert.equal(r.value.intro.length, 2000);
+  assert.equal(r.value.signoff.length, 2000);
+  assert.equal(r.value.summaryOverride.length, 8000);
 });
 
 test("clamps a per-turn edit at its cap", () => {
@@ -92,12 +97,71 @@ test("clamps a per-turn edit at its cap", () => {
   );
   assert.equal(r.ok, true);
   assert.equal(r.value.transcript.edits["seg-1"].length, SELECTION_LIMITS.turnEdit);
+  // Pin the literal cap value from the spec.
+  assert.equal(r.value.transcript.edits["seg-1"].length, 2000);
 });
 
 test("unknown section keys are ignored rather than passed through", () => {
   const r = parseNotesEmailSelection({ ...base, sections: { summary: true, evil: true } }, meeting, { ownerDomains: ["b.com"] });
   assert.equal(r.ok, true);
   assert.equal("evil" in r.value.sections, false);
+});
+
+test("exactly MAX_RECIPIENTS (25) is accepted, and 26 is rejected", () => {
+  const exactly25 = Array.from({ length: 25 }, (_, i) => `u${i}@b.com`);
+  const r = parseNotesEmailSelection({ ...base, recipients: exactly25, confirmExternal: true }, meeting, {});
+  assert.equal(r.ok, true);
+  assert.equal(r.value.recipients.length, 25);
+
+  const exceed25 = Array.from({ length: 26 }, (_, i) => `u${i}@b.com`);
+  const r2 = parseNotesEmailSelection({ ...base, recipients: exceed25, confirmExternal: true }, meeting, {});
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, "too_many_recipients");
+});
+
+test("confirmExternal must be boolean true, not just truthy", () => {
+  // String "true" is truthy but not boolean true
+  const r1 = parseNotesEmailSelection({ ...base, confirmExternal: "true" }, meeting, { ownerDomains: ["ostryaai.com"] });
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, "external_not_confirmed");
+
+  // Number 1 is truthy but not boolean true
+  const r2 = parseNotesEmailSelection({ ...base, confirmExternal: 1 }, meeting, { ownerDomains: ["ostryaai.com"] });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, "external_not_confirmed");
+
+  // Empty object is truthy but not boolean true
+  const r3 = parseNotesEmailSelection({ ...base, confirmExternal: {} }, meeting, { ownerDomains: ["ostryaai.com"] });
+  assert.equal(r3.ok, false);
+  assert.equal(r3.code, "external_not_confirmed");
+
+  // Only boolean true succeeds
+  const r4 = parseNotesEmailSelection({ ...base, confirmExternal: true }, meeting, { ownerDomains: ["ostryaai.com"] });
+  assert.equal(r4.ok, true);
+});
+
+test("__proto__ in sections object does not appear as a key and does not throw", () => {
+  const malicious = { ...base, sections: { summary: true, __proto__: { evil: "POLLUTED" } } };
+  // The attacker wants to inject __proto__ as a key to pollute the prototype chain
+  const r = parseNotesEmailSelection(malicious, meeting, { ownerDomains: ["b.com"] });
+  assert.equal(r.ok, true);
+  // Verify __proto__ does not appear as a string key in the own properties (the injection fails)
+  assert.equal(Object.prototype.hasOwnProperty.call(r.value.sections, "__proto__"), false);
+  // Verify only SECTION_KEYS are present
+  const keys = Object.keys(r.value.sections);
+  assert.equal(keys.every((k) => ["summary", "decisions", "actionItems", "openQuestions", "risks", "transcript", "rawEvidence"].includes(k)), true);
+});
+
+test("__proto__ in transcript.edits does not appear as a key and does not throw", () => {
+  const malicious = { ...base, sections: { transcript: true }, transcript: { includeIds: ["seg-1"], edits: { "seg-1": "text", __proto__: { evil: "POLLUTED" } } } };
+  // The attacker wants to inject __proto__ as a key in edits
+  const r = parseNotesEmailSelection(malicious, meeting, { ownerDomains: ["b.com"] });
+  assert.equal(r.ok, true);
+  // Verify __proto__ does not appear as a string key in the own properties (the injection fails)
+  assert.equal(Object.prototype.hasOwnProperty.call(r.value.transcript.edits, "__proto__"), false);
+  // Verify only validated segment ids are present
+  const keys = Object.keys(r.value.transcript.edits);
+  assert.equal(keys.every((k) => ["seg-1", "seg-2"].includes(k)), true);
 });
 
 test("isExternalRecipient compares domains case-insensitively", () => {
