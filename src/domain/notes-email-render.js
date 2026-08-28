@@ -65,8 +65,12 @@ export function renderNotesEmail({ meeting, selection }) {
   if (s.summary) text.push("SUMMARY", summary || "No summary was generated.", "");
   if (s.decisions) text.push("DECISIONS", formatListText(decisions), "");
   if (s.actionItems) text.push("ACTION ITEMS", formatActionItemsText(actionItems), "");
-  if (s.openQuestions) text.push("OPEN QUESTIONS", formatListText(notes.openQuestions), "");
-  if (s.risks) text.push("RISKS", formatListText(notes.risks), "");
+  // formatListText(items = []) only defaults on undefined; a stored `null` (a meeting
+  // whose notes were generated before this field existed, or a provider that emitted
+  // null rather than omitting the key) reaches .length and throws, turning a render into
+  // a 500. The html build below already guards both fields the same way.
+  if (s.openQuestions) text.push("OPEN QUESTIONS", formatListText(notes.openQuestions || []), "");
+  if (s.risks) text.push("RISKS", formatListText(notes.risks || []), "");
   if (s.transcript) {
     text.push("TRANSCRIPT");
     text.push(

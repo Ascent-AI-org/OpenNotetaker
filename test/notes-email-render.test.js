@@ -163,3 +163,21 @@ test("renders with no notes at all rather than throwing", () => {
   assert.equal(typeof out.text, "string");
   assert.equal(typeof out.html, "string");
 });
+
+test("a stored null for openQuestions or risks renders as empty rather than throwing", () => {
+  // Finding G: formatListText(items = []) only defaults on undefined, not null. A
+  // meeting whose notes carry a stored `null` for either field (rather than an omitted
+  // key) used to throw reading .length inside formatListText and turn the route into a
+  // 500.
+  const nullNotes = {
+    id: "m3",
+    title: "Nulled",
+    artifacts: { notes: { ...meeting.artifacts.notes, openQuestions: null, risks: null } }
+  };
+  const out = renderNotesEmail({
+    meeting: nullNotes,
+    selection: selection({ sections: { ...selection().sections, openQuestions: true, risks: true } })
+  });
+  assert.match(out.text, /OPEN QUESTIONS\nNone\./);
+  assert.match(out.text, /RISKS\nNone\./);
+});
