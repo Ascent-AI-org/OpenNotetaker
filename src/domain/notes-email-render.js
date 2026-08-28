@@ -15,7 +15,8 @@ import {
   formatRawTranscriptText,
   formatActionItemsHtml,
   formatListHtml,
-  formatTranscriptRowsHtml
+  formatTranscriptRowsHtml,
+  emailDocument
 } from "./notes-sections.js";
 
 // Well under Gmail's own message limit, so an oversized send fails in this app with an
@@ -83,21 +84,47 @@ export function renderNotesEmail({ meeting, selection }) {
   if (s.rawEvidence) text.push("RAW TRANSCRIPT EVIDENCE", formatRawTranscriptText(meeting?.artifacts?.rawSegments || []), "");
   if (selection.signoff) text.push(selection.signoff);
 
-  const html = [
-    `<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:14px;line-height:1.6;color:#172033;max-width:720px">`,
-    selection.intro ? `<p>${escapeHtml(selection.intro).replace(/\n/g, "<br>")}</p>` : "",
-    `<h1 style="font-size:20px;margin:16px 0 4px">${escapeHtml(meeting?.title || "Meeting")}</h1>`,
-    meeting?.scheduledAt ? `<p style="color:#667;margin:0 0 16px">${escapeHtml(formatDate(meeting.scheduledAt))}</p>` : "",
-    s.summary ? section("Summary", `<p>${escapeHtml(summary)}</p>`) : "",
-    s.decisions ? section("Decisions", formatListHtml(decisions)) : "",
-    s.actionItems ? section("Action items", formatActionItemsHtml(actionItems)) : "",
-    s.openQuestions ? section("Open questions", formatListHtml(notes.openQuestions || [])) : "",
-    s.risks ? section("Risks", formatListHtml(notes.risks || [])) : "",
-    s.transcript ? section("Transcript", formatTranscriptRowsHtml(turns)) : "",
-    s.rawEvidence ? section("Raw transcript evidence", `<pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(formatRawTranscriptText(meeting?.artifacts?.rawSegments || []))}</pre>`) : "",
-    selection.signoff ? `<p style="margin-top:24px">${escapeHtml(selection.signoff).replace(/\n/g, "<br>")}</p>` : "",
-    `</div>`
+  // Rendered into the shared email shell rather than a bare styled <div>. A composed note
+  // and the automatic transcript email come from the same product and land in the same
+  // inbox; the operator picking sections is choosing CONTENT, not opting out of the
+  // template. Class names below are the shell's own — see emailDocument in notes-sections.js.
+  const metaRows = [
+    meeting?.meetUrl
+      ? `<div class="meta-row"><span class="meta-label">Meet</span><span class="meta-value"><a href="${escapeHtml(meeting.meetUrl)}">${escapeHtml(meeting.meetUrl)}</a></span></div>`
+      : "",
+    meeting?.scheduledAt
+      ? `<div class="meta-row"><span class="meta-label">Scheduled</span><span class="meta-value">${escapeHtml(formatDate(meeting.scheduledAt))}</span></div>`
+      : ""
   ].join("");
+
+  const html = emailDocument({
+    // What a mail client shows beside the subject before anything is opened. The operator's
+    // own intro if they wrote one, since that is the sentence they chose to lead with.
+    preheader: selection.intro || summary || "Meeting notes from OpenNotetaker.",
+    inner: [
+      `<section class="hero">`,
+      `<p class="eyebrow">Meeting notes</p>`,
+      `<h1>${escapeHtml(meeting?.title || "Meeting")}</h1>`,
+      metaRows ? `<div class="meta">${metaRows}</div>` : "",
+      `</section>`,
+      selection.intro
+        ? `<section class="section"><p class="text">${escapeHtml(selection.intro).replace(/\n/g, "<br>")}</p></section>`
+        : "",
+      s.summary ? section("Summary", `<p class="text">${escapeHtml(summary)}</p>`) : "",
+      s.decisions ? section("Decisions", formatListHtml(decisions)) : "",
+      s.actionItems ? section("Action items", formatActionItemsHtml(actionItems)) : "",
+      s.openQuestions ? section("Open questions", formatListHtml(notes.openQuestions || [])) : "",
+      s.risks ? section("Risks", formatListHtml(notes.risks || [])) : "",
+      s.transcript ? section("Transcript", formatTranscriptRowsHtml(turns)) : "",
+      s.rawEvidence
+        ? section("Raw transcript evidence", `<pre class="text" style="white-space:pre-wrap;font-size:12px">${escapeHtml(formatRawTranscriptText(meeting?.artifacts?.rawSegments || []))}</pre>`)
+        : "",
+      selection.signoff
+        ? `<section class="section"><p class="text">${escapeHtml(selection.signoff).replace(/\n/g, "<br>")}</p></section>`
+        : "",
+      `<p class="footer">Sent from OpenNotetaker. Edits in this email apply to this send only \u2014 the meeting's stored notes are unchanged.</p>`
+    ].join("")
+  });
 
   // A ceiling on the whole rendered body. A 685-turn transcript is already tens of
   // thousands of characters, and a provider-side rejection tells the operator nothing they
@@ -112,5 +139,5 @@ export function renderNotesEmail({ meeting, selection }) {
 }
 
 function section(title, inner) {
-  return `<h3 style="margin:24px 0 8px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#667">${escapeHtml(title)}</h3>${inner}`;
+  return `<section class="section"><h2>${escapeHtml(title)}</h2>${inner}</section>`;
 }
