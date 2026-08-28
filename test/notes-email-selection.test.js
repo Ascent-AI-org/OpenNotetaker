@@ -141,7 +141,12 @@ test("confirmExternal must be boolean true, not just truthy", () => {
 });
 
 test("__proto__ in sections object does not appear as a key and does not throw", () => {
-  const malicious = { ...base, sections: { summary: true, __proto__: { evil: "POLLUTED" } } };
+  // An object LITERAL's `__proto__:` key is the prototype setter, not an own property —
+  // { __proto__: {...} } never puts "__proto__" on the object no matter what this
+  // function does, so a literal here would pass against an implementation with zero
+  // defence. JSON.parse is how a real HTTP body arrives, and JSON.parse DOES create an
+  // own "__proto__" property, which is the actual attack this test exists to catch.
+  const malicious = { ...base, sections: JSON.parse(String.raw`{"summary":true,"__proto__":{"evil":"POLLUTED"}}`) };
   // The attacker wants to inject __proto__ as a key to pollute the prototype chain
   const r = parseNotesEmailSelection(malicious, meeting, { ownerDomains: ["b.com"] });
   assert.equal(r.ok, true);
@@ -150,18 +155,29 @@ test("__proto__ in sections object does not appear as a key and does not throw",
   // Verify only SECTION_KEYS are present
   const keys = Object.keys(r.value.sections);
   assert.equal(keys.every((k) => ["summary", "decisions", "actionItems", "openQuestions", "risks", "transcript", "rawEvidence"].includes(k)), true);
+  // The property that actually matters: no other object in the process inherited "evil".
+  assert.equal(({}).evil, undefined);
 });
 
-test("__proto__ in transcript.edits does not appear as a key and does not throw", () => {
-  const malicious = { ...base, sections: { transcript: true }, transcript: { includeIds: ["seg-1"], edits: { "seg-1": "text", __proto__: { evil: "POLLUTED" } } } };
-  // The attacker wants to inject __proto__ as a key in edits
+test("__proto__ in transcript.edits is rejected as an unknown segment, not silently accepted", () => {
+  // Same reasoning as the sections test above: JSON.parse is what makes "__proto__"
+  // arrive as a real own property of the edits object, the way it would from an actual
+  // request body — Object.entries(edits) below sees it as a normal ["__proto__", {...}]
+  // pair.
+  const malicious = {
+    ...base,
+    sections: { transcript: true },
+    transcript: JSON.parse(String.raw`{"includeIds":["seg-1"],"edits":{"seg-1":"text","__proto__":{"evil":"POLLUTED"}}}`)
+  };
   const r = parseNotesEmailSelection(malicious, meeting, { ownerDomains: ["b.com"] });
-  assert.equal(r.ok, true);
-  // Verify __proto__ does not appear as a string key in the own properties (the injection fails)
-  assert.equal(Object.prototype.hasOwnProperty.call(r.value.transcript.edits, "__proto__"), false);
-  // Verify only validated segment ids are present
-  const keys = Object.keys(r.value.transcript.edits);
-  assert.equal(keys.every((k) => ["seg-1", "seg-2"].includes(k)), true);
+  // The edits loop iterates Object.entries(rawEdits), which yields "__proto__" as an
+  // ordinary key, and knownIds.has("__proto__") is false — the same allowlist check
+  // that blocks segment injection (line ~65) blocks this too, and blocks it harder than
+  // stripping the key would: the whole request is refused rather than continuing with
+  // attacker data quietly dropped.
+  assert.equal(r.ok, false);
+  assert.equal(r.code, "unknown_segment");
+  assert.equal(({}).evil, undefined);
 });
 
 test("decisions is capped at MAX_ACTION_ITEMS entries, not just clamped per-item", () => {
