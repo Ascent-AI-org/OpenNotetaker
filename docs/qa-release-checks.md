@@ -305,8 +305,8 @@ send and never touch the stored meeting record.
 - [ ] **NC-06 — notes.email_sent appears in the run log with recipients**
   - **Do:** Compose & send a meeting to two recipients, then expand the run log at the
     bottom.
-  - **Expect:** An entry reads "Notes emailed to: *recipient1*, *recipient2*" (or similar
-    phrasing). The run log names both recipients.
+  - **Expect:** A `notes.email_sent` entry records the send with both recipients named
+    and the sections sent listed in parentheses.
 - [ ] **NC-07 — Raw evidence is disabled when any turn is deselected** 🔴 *redaction trap*
   - **Do:** In Compose & send with raw evidence enabled, deselect one transcript turn.
   - **Expect:** The raw evidence checkbox is disabled and grayed out. Toggling a turn
@@ -314,11 +314,11 @@ send and never touch the stored meeting record.
     text would leak into raw evidence.
 - [ ] **NC-08 — Client-safe preset omits internal sections**
   - **Do:** Compose & send, pick the **Client-safe** template.
-  - **Expect:** Summary, decisions, and action items are on. Detailed notes, open
-    questions, risks, transcript, and raw evidence are off by default. The preset
-    matches the documented "summary, decisions, action items only" list.
+  - **Expect:** Summary, decisions, and action items are on. Open questions, risks,
+    transcript, and raw evidence are off by default. The preset matches the documented
+    "summary, decisions, action items only" list.
 - [ ] **NC-09 — A non-owner gets 404 on the notes endpoint** 🔴 *access control if it fails*
-  - **Do:** As user B, call `POST /api/meetings/<user A meeting id>/send-notes` with a
+  - **Do:** As user B, call `POST /api/meetings/<user A meeting id>/notes-email` with a
     valid body.
   - **Expect:** `404` — never `403`, never "forbidden". The meeting's existence does not
     leak.
