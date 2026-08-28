@@ -167,7 +167,7 @@ function postNotesEmail(baseUrl, cookie, meetingId, payload, { preview = false }
   });
 }
 
-test("preview renders without sending and matches what a send would produce", async (t) => {
+test("preview renders without sending and records nothing", async (t) => {
   const server = await startServer();
   t.after(() => server.stop());
 
