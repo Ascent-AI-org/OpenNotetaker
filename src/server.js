@@ -78,6 +78,8 @@ import {
   selectExportMeetings
 } from "./domain/export.js";
 import { buildTranscriptEmail } from "./domain/transcript-email.js";
+import { parseNotesEmailSelection } from "./domain/notes-email-selection.js";
+import { renderNotesEmail } from "./domain/notes-email-render.js";
 import {
   CALENDAR_READONLY_SCOPE,
   GMAIL_SEND_SCOPE,
@@ -187,6 +189,10 @@ const exportLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, m
 // Cutting a clip is an ffmpeg re-encode on the same box that runs transcription, and it
 // writes a new file to the same disk. Both are bounded per account before the work starts.
 const clipLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
+// A composed send is an outbound email under the owner's own Google account. Bounded per
+// account for the same reason exports are: the expensive, irreversible thing here is the
+// mail, not the render.
+const notesEmailLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 // A recording cannot have started longer ago than the longest meeting the bot will sit
 // through, plus slack for the upload drain.
 const MAX_CAPTURE_START_AGE_MS = (config.runner.maxDurationMinutes + 60) * 60 * 1000;
@@ -1150,6 +1156,152 @@ async function route(request, response) {
     }
   }
 
+  const notesEmailMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/notes-email$/);
+  if (notesEmailMatch && request.method === "POST") {
+    const user = await requireUser(request, response);
+    if (!user) return;
+    const meeting = getOwnedMeeting(notesEmailMatch[1], user);
+    if (!meeting) return sendJson(response, 404, { error: "not_found" });
+    if (meeting.status !== "completed") {
+      return sendJson(response, 409, {
+        error: "meeting_not_completed",
+        message: "Notes can be sent once the meeting is finalized."
+      });
+    }
+
+    const preview = url.searchParams.get("preview") === "1";
+    const body = await readJsonBody(request);
+    const accounts = listGoogleAccounts(user);
+    const parsed = parseNotesEmailSelection(body, meeting, { ownerDomains: ownerDomainsFor(accounts, user) });
+    if (!parsed.ok) {
+      const status = parsed.code === "external_not_confirmed" ? 409 : 400;
+      return sendJson(response, status, { error: parsed.code, message: parsed.error });
+    }
+
+    let rendered;
+    try {
+      rendered = renderNotesEmail({ meeting, selection: parsed.value });
+    } catch (error) {
+      // Over the ceiling is the caller asking for too much, not a server fault.
+      if (error.code === "body_too_large") {
+        return sendJson(response, 413, { error: "body_too_large", message: error.message });
+      }
+      throw error;
+    }
+    // Rendering is cheap and changes nothing; only the send is charged and limited.
+    if (preview) return sendJson(response, 200, rendered);
+
+    if (!notesEmailLimiter.consume(`notes-email:${user.id}`).allowed) {
+      return sendJson(response, 429, { error: "rate_limited", message: "Too many sends in a short window." });
+    }
+
+    if (!isGmailConfigured()) {
+      return sendJson(response, 400, {
+        error: "email_failed",
+        message: "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET before sending notes email."
+      });
+    }
+    const sender = pickSendingAccount(accounts, { preferAccountIds: meetingAccountIds(meeting) });
+    if (!sender) {
+      return sendJson(response, 400, {
+        error: "email_failed",
+        message: "Connect a Google account with Gmail access before sending notes email."
+      });
+    }
+    const tokenPath = userGoogleTokenPath(user.id, sender.id);
+    if (!(await hasUsableGmailToken(tokenPath))) {
+      return sendJson(response, 400, {
+        error: "email_failed",
+        message: `Reconnect ${sender.email || "your Google account"} before sending notes email.`
+      });
+    }
+
+    const providerMessageIds = [];
+    const failedRecipients = [];
+    for (const recipient of parsed.value.recipients) {
+      const message = createMimeMessage({
+        to: recipient,
+        // Empty From: Gmail stamps the authenticated account, which is always correct.
+        from: "",
+        subject: rendered.subject,
+        text: rendered.text,
+        html: rendered.html
+      });
+      try {
+        const sent = await sendGmailMessage({ auth: getGoogleAuth(), tokenPath, message });
+        providerMessageIds.push({ recipient, providerMessageId: sent?.id || "" });
+      } catch (error) {
+        failedRecipients.push({ recipient, error: error.message });
+      }
+    }
+
+    // Nothing delivered: there is nothing to audit as "sent", so no delivery record is
+    // written — but the attempt itself must not vanish. Without this event, someone
+    // reading the meeting's history a moment later would see no trace that a send was
+    // ever tried, exactly like transcript.email_failed / action_items.email_failed
+    // already leave one for their own total failures.
+    if (!providerMessageIds.length) {
+      const failureDetail = failedRecipients.map((entry) => `${entry.recipient} (${entry.error})`).join(", ");
+      await store.appendEvent(meeting.id, {
+        type: "notes.email_failed",
+        message: `Notes email failed for ${failureDetail}.`
+      });
+      return sendJson(response, 400, {
+        error: "email_failed",
+        message: `Notes email failed for ${failureDetail}.`,
+        failedRecipients
+      });
+    }
+
+    // Re-read immediately before merging rather than reusing the `meeting` captured at
+    // handler entry: the send loop above just spent one network round-trip per recipient,
+    // and store.updateMeeting only deep-merges `artifacts` — `delivery` is replaced
+    // wholesale. Merging against the stale copy would silently drop a delivery.* entry
+    // written by a concurrent action-items or transcript send that landed in that window.
+    // updateTranscriptEmailDelivery / updateActionItemsDelivery re-read for the same
+    // reason.
+    const current = store.getMeeting(meeting.id);
+    // Partial success is still a send: the delivered copies cannot be unsent, and
+    // failedRecipients records exactly who still needs one — the same call the
+    // action-items sender already makes. recipients here is the full attempted list (who
+    // this send was addressed to); the event message below names only who it actually
+    // reached, so "sent to" cannot overstate a partial failure.
+    const updated = await store.updateMeeting(meeting.id, {
+      delivery: {
+        ...(current?.delivery || {}),
+        notesEmail: {
+          sentAt: new Date().toISOString(),
+          recipients: parsed.value.recipients,
+          subject: rendered.subject,
+          sections: parsed.value.sections,
+          // Read from what renderNotesEmail actually put in the email, not recomputed
+          // here from the selection: sections.transcript can be off while
+          // transcript.includeIds/edits still carry values (the UI clears the section
+          // but leaves them), and recomputing independently is exactly the
+          // two-definitions-drift that notes-sections.js was extracted to prevent one
+          // level down — recreating it at this layer would defeat the point.
+          turnsSent: rendered.turnsRendered,
+          turnsEdited: rendered.turnsEditedRendered,
+          providerMessageIds,
+          failedRecipients
+        }
+      }
+    });
+    const sentTo = providerMessageIds.map((entry) => entry.recipient).join(", ");
+    const sentSections = Object.entries(parsed.value.sections).filter(([, on]) => on).map(([key]) => key).join(", ") || "no sections";
+    const failedClause = failedRecipients.length
+      ? ` (failed for ${failedRecipients.map((entry) => entry.recipient).join(", ")})`
+      : "";
+    await store.appendEvent(meeting.id, {
+      type: "notes.email_sent",
+      message: `Notes sent to ${sentTo} (${sentSections})${failedClause}.`
+    });
+    return sendJson(response, 200, {
+      meeting: publicMeeting(updated),
+      delivery: updated.delivery.notesEmail
+    });
+  }
+
   // Video playback, clips and share links. Ownership is the same getOwnedMeeting check the
   // rest of the meeting routes use, so someone else's meeting id answers 404 here exactly
   // as it does there — a 403 would confirm the recording exists.
@@ -2053,6 +2205,16 @@ function deliverySentToAll(delivery, recipients) {
     : [delivery.recipient].filter(Boolean);
   const normalizedSent = new Set(sentRecipients.map((recipient) => recipient.toLowerCase()));
   return recipients.every((recipient) => normalizedSent.has(recipient.toLowerCase()));
+}
+
+// Domains the owner is actually connected with. Anything else is external, which is what
+// gates the confirmation — the same notion attendeeSuggestions already uses to mark an
+// address as "not from your company".
+function ownerDomainsFor(accounts, user) {
+  const domains = accounts.map((account) => String(account.email || "").split("@")[1]).filter(Boolean);
+  const own = String(user.email || "").split("@")[1];
+  if (own) domains.push(own);
+  return [...new Set(domains.map((d) => d.toLowerCase()))];
 }
 
 async function googleAccountsPayload(user) {

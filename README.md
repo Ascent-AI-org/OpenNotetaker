@@ -192,6 +192,50 @@ leaves. **Don't send** cancels this meeting's send; **Send now** skips the wait.
 Set the hold to `0` to send as soon as notes are ready. The schedule lives on the
 meeting rather than in a timer, so a restart mid-hold still delivers.
 
+## Composing and sending notes
+
+Beyond action items, you can compose and send the full meeting notes, the transcript,
+or any combination of sections — one email, edited however you want, without touching
+the stored record.
+
+**Presets and per-send edits.** Press **Compose & send** on any finished meeting and
+choose a starting template: *Full record* includes every section (summary, decisions,
+action items, open questions, risks, transcript, and raw Hinglish evidence), while
+*Client-safe* sends only the summary, decisions, and action items. Edit anything after:
+wording, section toggles, individual turns, recipients. These edits exist only for this
+send and never modify the meeting's stored notes, transcript, or action items — the same
+typo must be corrected on each send.
+
+**Transcript turns.** If you include the transcript in the email, each turn is
+individually selectable: tick or untick to include or exclude, and edit the text
+inline. Select-all, select-none, drop-before-here, and drop-after-here buttons help
+you trim the transcript quickly.
+
+**Recipients.** Enter any address in the recipient field. Calendar attendees appear as
+suggestion chips below, with anyone outside your connected Google domains marked
+⚠ and highlighted in amber. Clicking a chip adds them; they persist until you remove
+them. Sending to an outside address asks for confirmation — the server enforces this
+before the email is sent, so a recipient outside your connected domains is flagged and
+requires that confirmation rather than going out silently. That check is only as
+precise as "connected domain": if you signed up with a freemail address, your own
+domain (e.g. gmail.com) is treated as internal, and so is every other recipient on it.
+
+**Preview.** Before sending, press **Preview** to see the exact email that will be
+delivered — same formatting, same sections, same edited turns. The preview uses the
+exact renderer the send uses, so what you see is what recipients get. Previewing does
+not count toward rate limits and does not modify the stored meeting.
+
+**Recording the send.** Every completed send creates a `delivery.notesEmail` entry
+(recipients, sections sent, turns sent, and provider message ids) plus a
+`notes.email_sent` run-log event. Failed sends append `notes.email_failed`. The email
+body itself is not stored — only the metadata needed to audit what was sent and to whom.
+
+**Raw evidence and transcript selection.** The UI enforces a rule: raw evidence is
+disabled whenever any transcript turn is deselected. This prevents an accidental
+combination where a turn is redacted from the transcript but its text would still leak
+into the raw evidence section. If you script directly against the API endpoint, you
+must enforce this rule yourself — the server does not.
+
 ## Accounts and team
 
 OpenNotetaker is multi-user; every meeting, transcript, and Google connection is

@@ -166,6 +166,116 @@
       </form>
     </dialog>
 
+    <dialog id="compose-dialog" class="dialog dialog-compose">
+      <form id="compose-form" method="dialog" novalidate>
+        <header class="dialog-head dialog-head-row">
+          <h2>Compose &amp; send</h2>
+          <button type="button" class="btn btn-ghost btn-sm" data-close-dialog>Close</button>
+        </header>
+        <p class="dialog-head-sub">
+          Choose who this goes to and what they see. Edits here apply to this send only &mdash;
+          the meeting's stored notes never change.
+        </p>
+
+        <div class="compose-body">
+          <section class="compose-group">
+            <p class="compose-label">Recipients</p>
+            <div id="compose-recipient-chips" class="recipient-chips"></div>
+            <div class="field">
+              <label for="compose-recipient-input">Add a recipient</label>
+              <input id="compose-recipient-input" type="text" autocomplete="off"
+                     placeholder="name@company.com &mdash; Enter or comma to add" />
+            </div>
+            <div id="compose-attendee-suggestions" class="suggestion-chips"></div>
+          </section>
+
+          <section class="compose-group">
+            <p class="compose-label">Preset</p>
+            <div id="compose-preset-row" class="compose-preset-row">
+              <label class="compose-choice">
+                <input type="radio" name="compose-preset" id="compose-preset-full" data-preset="full" />
+                <span>Full record &mdash; every section, including raw evidence. What the owner gets today.</span>
+              </label>
+              <label class="compose-choice">
+                <input type="radio" name="compose-preset" id="compose-preset-clientsafe" data-preset="clientSafe" />
+                <span>Client-safe &mdash; summary, decisions, action items. No risks, questions, transcript, or raw evidence.</span>
+              </label>
+            </div>
+            <p class="field-hint">A preset is a starting point, not a mode &mdash; pick one, then change anything below.</p>
+          </section>
+
+          <section class="compose-group">
+            <p class="compose-label">Sections</p>
+            <div id="compose-sections" class="compose-section-grid">
+              <label class="compose-choice"><input type="checkbox" data-section="summary" /><span>Summary</span></label>
+              <label class="compose-choice"><input type="checkbox" data-section="decisions" /><span>Decisions</span></label>
+              <label class="compose-choice"><input type="checkbox" data-section="actionItems" /><span>Action items</span></label>
+              <label class="compose-choice"><input type="checkbox" data-section="openQuestions" /><span>Open questions</span></label>
+              <label class="compose-choice"><input type="checkbox" data-section="risks" /><span>Risks</span></label>
+              <label class="compose-choice"><input type="checkbox" data-section="transcript" /><span>Transcript</span></label>
+              <label class="compose-choice" id="compose-raw-evidence-choice">
+                <input type="checkbox" data-section="rawEvidence" id="compose-raw-evidence" />
+                <span>Raw Hinglish evidence</span>
+              </label>
+            </div>
+            <p class="field-hint compose-raw-evidence-hint" id="compose-raw-evidence-hint"></p>
+          </section>
+
+          <details class="form-advanced">
+            <summary>Subject &amp; message</summary>
+            <div class="form-advanced-body">
+              <div class="field">
+                <label for="compose-subject">Subject</label>
+                <input id="compose-subject" maxlength="200" placeholder="Notes: meeting title" />
+              </div>
+              <div class="field">
+                <label for="compose-intro">Intro</label>
+                <textarea id="compose-intro" maxlength="2000" rows="2" placeholder="Hi Ishaan, thanks for the time today."></textarea>
+              </div>
+              <div class="field">
+                <label for="compose-signoff">Sign-off</label>
+                <textarea id="compose-signoff" maxlength="2000" rows="2" placeholder="Best,&#10;Dhruv"></textarea>
+              </div>
+            </div>
+          </details>
+
+          <section class="compose-group">
+            <div class="compose-transcript-head">
+              <p class="compose-label">Transcript <span id="compose-transcript-count" class="sec-count"></span></p>
+              <div class="compose-bulk-actions">
+                <button type="button" class="btn btn-ghost btn-sm" id="compose-turns-all">All</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="compose-turns-none">None</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="compose-turns-drop-before" disabled>Drop before &uarr;</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="compose-turns-drop-after" disabled>Drop after &darr;</button>
+              </div>
+            </div>
+            <p class="field-hint">
+              Click a timestamp to anchor it, then Drop before/after trims around it. Click a line's
+              text to edit it for this send only &mdash; the stored transcript is untouched.
+            </p>
+            <div id="compose-turn-list" class="compose-turn-list"></div>
+          </section>
+
+          <div class="compose-error-row">
+            <p id="compose-error" class="form-error" role="alert"></p>
+            <button type="button" class="btn btn-secondary btn-sm" id="compose-confirm-external" hidden>Confirm &amp; continue</button>
+          </div>
+
+          <section class="compose-group compose-preview-group" id="compose-preview-group" hidden>
+            <p class="compose-label">Preview</p>
+            <p id="compose-preview-subject" class="compose-preview-subject"></p>
+            <iframe id="compose-preview-frame" class="compose-preview-frame" title="Email preview" sandbox=""></iframe>
+          </section>
+        </div>
+
+        <footer class="dialog-actions compose-actions">
+          <button type="button" class="btn btn-ghost" data-close-dialog>Cancel</button>
+          <button type="button" class="btn btn-secondary" id="compose-preview-button">Preview</button>
+          <button type="submit" class="btn btn-primary" id="compose-send-button">Send</button>
+        </footer>
+      </form>
+    </dialog>
+
     <dialog id="settings-dialog" class="dialog dialog-wide">
       <header class="dialog-head dialog-head-row">
         <h2>Settings</h2>

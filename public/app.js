@@ -1,3 +1,7 @@
+// Pure logic pulled out so it is testable without a DOM — see the comment there for why
+// it lives in its own file instead of just being a function in this one.
+import { canEnableRawEvidence } from "./compose-guard.js";
+
 const state = {
   user: null,
   authMode: "login",
@@ -63,6 +67,59 @@ state.export = {
   busy: false,
   error: ""
 };
+
+// Per-send by design: this lives in memory only and is discarded when the dialog closes.
+// Nothing here is ever written back to the meeting.
+const composerState = {
+  meetingId: "",
+  recipients: [],
+  confirmExternal: false,
+  subject: "",
+  intro: "",
+  signoff: "",
+  sections: { summary: true, decisions: true, actionItems: true, openQuestions: false, risks: false, transcript: false, rawEvidence: false },
+  includeIds: new Set(),
+  edits: new Map(),
+  // UI-only bookkeeping below — none of it is part of the request body.
+  preset: "clientSafe", // which radio reads as selected; null once the operator diverges from both
+  error: "",
+  needsExternalConfirm: false,
+  pendingPreview: false, // which action the external-confirm retry should repeat
+  inFlight: null, // null | "preview" | "send" — drives button labels
+  // busy + activeRequestId together are the actual duplicate-send guard: busy blocks a
+  // second click while a request is outstanding, and activeRequestId is what stops a
+  // response that arrives after the dialog has moved on (closed and reopened, or sent
+  // again for the same or a different meeting) from releasing that guard early. A plain
+  // meetingId comparison isn't enough on its own — a second send for the SAME meeting
+  // would share it with the first — so this is a token, minted fresh per submitCompose
+  // call (see composeRequestSeq), not a meeting identity.
+  busy: false,
+  activeRequestId: 0
+};
+
+const PRESETS = {
+  full: { summary: true, decisions: true, actionItems: true, openQuestions: true, risks: true, transcript: true, rawEvidence: true },
+  clientSafe: { summary: true, decisions: true, actionItems: true, openQuestions: false, risks: false, transcript: false, rawEvidence: false }
+};
+
+// Source of the token above. Module-level (not composerState) because it must keep
+// counting across dialog opens/closes — resetting it on open would let a request from a
+// PRIOR session collide with request #1 of a new one.
+let composeRequestSeq = 0;
+
+// Transcript rows are built once per dialog open and mutated in place (see
+// buildComposeTurnList); a 685-turn meeting is thousands of DOM nodes, cheap to build
+// once and expensive to rebuild on every checkbox click or keystroke. Kept outside
+// composerState because these are DOM handles and a raw snapshot, not request data.
+let composeSegments = [];
+let composeRows = new Map();
+let composeAnchorId = null;
+
+// Mirrors MAX_RECIPIENTS (src/domain/note-delivery.js) and the pattern
+// notes-email-selection.js validates with. This is only so an obviously-wrong entry
+// gets an answer without a round trip — the server's own check is what is authoritative.
+const COMPOSE_EMAIL_PATTERN = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/u;
+const MAX_COMPOSE_RECIPIENTS = 25;
 
 // What the UI assumes when the server has not said otherwise. `enabled: false` is the
 // load-bearing part: an install with VIDEO_RECORDING_ENABLED off, an older server with
@@ -154,6 +211,35 @@ const clipLengthHint = $("#clip-length");
 const clipError = $("#clip-error");
 const clipCreateButton = $("#clip-create");
 
+const composeDialog = $("#compose-dialog");
+const composeForm = $("#compose-form");
+const composeRecipientChips = $("#compose-recipient-chips");
+const composeRecipientInput = $("#compose-recipient-input");
+const composeAttendeeSuggestions = $("#compose-attendee-suggestions");
+const composePresetRow = $("#compose-preset-row");
+const composePresetFullInput = $("#compose-preset-full");
+const composePresetClientSafeInput = $("#compose-preset-clientsafe");
+const composeSectionsContainer = $("#compose-sections");
+const composeRawEvidenceInput = $("#compose-raw-evidence");
+const composeRawEvidenceChoice = $("#compose-raw-evidence-choice");
+const composeRawEvidenceHint = $("#compose-raw-evidence-hint");
+const composeSubjectInput = $("#compose-subject");
+const composeIntroInput = $("#compose-intro");
+const composeSignoffInput = $("#compose-signoff");
+const composeTranscriptCount = $("#compose-transcript-count");
+const composeAllButton = $("#compose-turns-all");
+const composeNoneButton = $("#compose-turns-none");
+const composeDropBeforeButton = $("#compose-turns-drop-before");
+const composeDropAfterButton = $("#compose-turns-drop-after");
+const composeTurnListEl = $("#compose-turn-list");
+const composeErrorEl = $("#compose-error");
+const composeConfirmExternalButton = $("#compose-confirm-external");
+const composePreviewGroup = $("#compose-preview-group");
+const composePreviewSubject = $("#compose-preview-subject");
+const composePreviewFrame = $("#compose-preview-frame");
+const composePreviewButton = $("#compose-preview-button");
+const composeSendButton = $("#compose-send-button");
+
 const settingsDialog = $("#settings-dialog");
 const gmailStatusText = $("#gmail-status-text");
 const googleAccountsList = $("#google-accounts-list");
@@ -237,6 +323,33 @@ teamList.addEventListener("click", handleTeamAction);
 clipForm.addEventListener("submit", handleCreateClip);
 clipStartInput.addEventListener("input", renderClipLengthHint);
 clipEndInput.addEventListener("input", renderClipLengthHint);
+
+// Compose dialog: Send lives on the form's submit (Enter in Subject works like every
+// other single-line field here); Preview is a plain button so it never doubles as Enter.
+composeForm.addEventListener("submit", handleComposeSubmit);
+composePreviewButton.addEventListener("click", () => void submitCompose(true));
+composeConfirmExternalButton.addEventListener("click", handleComposeConfirmExternal);
+composeRecipientInput.addEventListener("keydown", handleComposeRecipientKeydown);
+composeRecipientInput.addEventListener("blur", commitComposeRecipientInput);
+// Chip removal and attendee-suggestion clicks: both rebuild on every recipient change,
+// so delegated on the dialog rather than bound per chip.
+composeDialog.addEventListener("click", handleComposeDialogClick);
+composeSectionsContainer.addEventListener("change", handleComposeSectionChange);
+composePresetRow.addEventListener("change", handleComposePresetChange);
+composeSubjectInput.addEventListener("input", () => (composerState.subject = composeSubjectInput.value));
+composeIntroInput.addEventListener("input", () => (composerState.intro = composeIntroInput.value));
+composeSignoffInput.addEventListener("input", () => (composerState.signoff = composeSignoffInput.value));
+composeAllButton.addEventListener("click", () => setAllComposeTurns(true));
+composeNoneButton.addEventListener("click", () => setAllComposeTurns(false));
+composeDropBeforeButton.addEventListener("click", () => dropComposeTurnsRelativeToAnchor("before"));
+composeDropAfterButton.addEventListener("click", () => dropComposeTurnsRelativeToAnchor("after"));
+// The turn list can hold thousands of nodes (a 685-turn meeting), so every interaction
+// with it is delegated on the list container rather than bound per row.
+composeTurnListEl.addEventListener("change", handleComposeTurnCheckboxChange);
+composeTurnListEl.addEventListener("click", handleComposeTurnListClick);
+composeTurnListEl.addEventListener("keydown", handleComposeTurnTextKeydown);
+composeTurnListEl.addEventListener("focusout", handleComposeTurnTextBlur);
+composeDialog.addEventListener("close", resetComposeDialog);
 
 // Export popover: delegated, because the app bar it lives in is rebuilt on every render.
 detail.addEventListener("click", handleExportClick);
@@ -1245,20 +1358,10 @@ function renderDetail() {
 
   wireActionItemControls(meeting);
 
-  detail.querySelector("#email-button")?.addEventListener("click", async () => {
-    state.sendingEmails.add(meeting.id);
-    renderCache.detail = "";
-    renderDetail();
-    try {
-      await api(`/api/meetings/${meeting.id}/email-transcript`, { method: "POST" });
-      await refresh();
-    } catch (error) {
-      setAppError(error.message);
-    } finally {
-      state.sendingEmails.delete(meeting.id);
-      renderCache.detail = "";
-      renderDetail();
-    }
+  detail.querySelector("#email-button")?.addEventListener("click", () => {
+    // The button used to send the fixed, full-record email itself. Now it only opens
+    // the composer — a choice of what to send is the entire point of this feature.
+    openComposeDialog(meeting);
   });
 }
 
@@ -1349,20 +1452,33 @@ function renderActionItemDelivery(meeting, items) {
 
 // Attendees are suggestions only — nothing is emailed to them until they are on the
 // recipient list, which is a choice someone makes here.
-function attendeeSuggestionsFor(meeting, recipients) {
-  const attendees = meeting.source?.googleCalendar?.attendees || [];
-  if (!attendees.length) return [];
-  const already = new Set((recipients || []).map((email) => email.toLowerCase()));
-  const domains = new Set(
+// The domains "internal" means for this account: the owner's own address plus every
+// connected Google account. Shared by the attendee suggestions and the composer's
+// recipient chips so the two agree on what counts as external.
+function ownerDomains() {
+  return new Set(
     [state.user?.email, ...(state.googleAccounts?.accounts || []).map((account) => account.email)]
       .filter(Boolean)
       .map((email) => email.split("@").pop().toLowerCase())
   );
+}
+
+// Client-side only — a hint for the UI, not the check that matters. The server enforces
+// the same rule on every recipient regardless of what this says (notes-email-selection.js).
+function isExternalEmail(email) {
+  const domain = String(email || "").split("@").pop()?.toLowerCase();
+  return !domain || !ownerDomains().has(domain);
+}
+
+function attendeeSuggestionsFor(meeting, recipients) {
+  const attendees = meeting.source?.googleCalendar?.attendees || [];
+  if (!attendees.length) return [];
+  const already = new Set((recipients || []).map((email) => email.toLowerCase()));
   return attendees
     .filter((person) => person.email && !already.has(person.email.toLowerCase()))
     .map((person) => ({
       ...person,
-      external: !domains.has(String(person.email).split("@").pop().toLowerCase())
+      external: isExternalEmail(person.email)
     }));
 }
 
@@ -2403,6 +2519,544 @@ async function reloadMeeting(id) {
   renderDetail();
 }
 
+/* ---------- Notes composer ----------
+   Sends a SELECTION to POST /api/meetings/:id/notes-email — never a finished message.
+   The server renders both the preview and the delivered mail from the same template, so
+   nothing built here is trusted content; it is a choice of what to include and a few
+   short edited strings, all re-validated server-side. See
+   docs/superpowers/specs/2026-08-27-notes-email-composer-design.md for the full design. */
+
+function currentComposeMeeting() {
+  return (state.meetings || []).find((meeting) => meeting.id === composerState.meetingId) || null;
+}
+
+function openComposeDialog(meeting) {
+  if (meeting.status !== "completed") return; // the button that opens this is disabled otherwise
+
+  const segments = meeting.artifacts?.normalizedSegments?.length
+    ? meeting.artifacts.normalizedSegments
+    : meeting.artifacts?.rawSegments || [];
+  composeSegments = segments.map((segment) => ({
+    id: segment.id,
+    speaker: segment.speaker || "Speaker",
+    start: Number(segment.start) || 0,
+    text: segment.english || segment.text || segment.raw || ""
+  }));
+  composeRows = new Map();
+  composeAnchorId = null;
+
+  composerState.meetingId = meeting.id;
+  composerState.recipients = [];
+  composerState.confirmExternal = false;
+  composerState.subject = `Notes: ${meeting.title || "Meeting"}`;
+  composerState.intro = "";
+  composerState.signoff = "";
+  composerState.sections = { ...PRESETS.clientSafe };
+  composerState.includeIds = new Set();
+  composerState.edits = new Map();
+  composerState.preset = "clientSafe";
+  composerState.error = "";
+  composerState.needsExternalConfirm = false;
+  composerState.pendingPreview = false;
+  composerState.inFlight = null;
+  composerState.busy = false;
+
+  composeSubjectInput.value = composerState.subject;
+  composeIntroInput.value = "";
+  composeSignoffInput.value = "";
+  renderComposeSections();
+  updatePresetRadios();
+  renderComposeRecipients();
+  renderComposeError();
+  buildComposeTurnList();
+  updateComposeTurnCount();
+  syncRawEvidenceGuard();
+  composePreviewGroup.hidden = true;
+  composePreviewFrame.srcdoc = "";
+  composeDropBeforeButton.disabled = true;
+  composeDropAfterButton.disabled = true;
+  // Collapsed by default so the transcript picker below it doesn't start scrolled out
+  // of view; a <details> otherwise keeps whatever the operator left it at, unlike the
+  // rest of this dialog, which is fully reset every time it opens.
+  const advanced = composeDialog.querySelector(".form-advanced");
+  if (advanced) advanced.open = false;
+  updateComposeButtons();
+
+  composeDialog.showModal();
+  composeRecipientInput.focus();
+}
+
+// Discards the scratchpad. Nothing built in this dialog is ever written back to the
+// meeting, so there is nothing to preserve once it closes — including on Cancel.
+function resetComposeDialog() {
+  composeSegments = [];
+  composeRows.clear();
+  composeAnchorId = null;
+  composePreviewFrame.srcdoc = "";
+  composerState.busy = false;
+  composerState.inFlight = null;
+}
+
+/* ---- Recipients ---- */
+
+function renderComposeRecipients() {
+  const meeting = currentComposeMeeting();
+
+  composeRecipientChips.innerHTML = composerState.recipients
+    .map((email) => {
+      const external = isExternalEmail(email);
+      return `
+        <span class="recipient-chip${external ? " external" : ""}">
+          ${escapeHtml(email)}
+          <button type="button" class="recipient-chip-remove" data-remove-recipient="${escapeHtml(email)}"
+                  aria-label="Remove ${escapeHtml(email)}">&times;</button>
+        </span>`;
+    })
+    .join("");
+
+  const suggestions = meeting ? attendeeSuggestionsFor(meeting, composerState.recipients) : [];
+  composeAttendeeSuggestions.innerHTML = suggestions
+    .map(
+      (person) => `
+        <button class="chip-add${person.external ? " external" : ""}" type="button"
+                data-compose-suggest="${escapeHtml(person.email)}"
+                title="${escapeHtml(person.external ? "Outside your company" : "Same company")}">
+          ${escapeHtml(person.name || person.email)}${person.external ? " ⚠" : ""}
+        </button>`
+    )
+    .join("");
+
+  updateComposeButtons();
+}
+
+function handleComposeRecipientKeydown(event) {
+  if (event.key === "Enter" || event.key === ",") {
+    event.preventDefault();
+    commitComposeRecipientInput();
+  } else if (event.key === "Backspace" && !composeRecipientInput.value && composerState.recipients.length) {
+    // Mirrors how every chip-style input on the web treats an empty backspace: the last
+    // chip is the thing your cursor is logically next to.
+    removeComposeRecipient(composerState.recipients[composerState.recipients.length - 1]);
+  }
+}
+
+function commitComposeRecipientInput() {
+  const raw = composeRecipientInput.value.trim().replace(/,$/u, "");
+  composeRecipientInput.value = "";
+  if (raw) addComposeRecipient(raw);
+}
+
+function addComposeRecipient(rawEmail) {
+  const email = rawEmail.trim().toLowerCase();
+  if (!COMPOSE_EMAIL_PATTERN.test(email)) {
+    composerState.error = `"${rawEmail.trim()}" doesn't look like an email address.`;
+    renderComposeError();
+    return;
+  }
+  if (composerState.recipients.includes(email)) return;
+  if (composerState.recipients.length >= MAX_COMPOSE_RECIPIENTS) {
+    composerState.error = `At most ${MAX_COMPOSE_RECIPIENTS} recipients.`;
+    renderComposeError();
+    return;
+  }
+  composerState.recipients.push(email);
+  // A changed recipient list is a new question about who this is going to — the
+  // previous confirmation does not carry over to someone who was not covered by it.
+  composerState.confirmExternal = false;
+  composerState.error = "";
+  composerState.needsExternalConfirm = false;
+  renderComposeError();
+  renderComposeRecipients();
+}
+
+function removeComposeRecipient(email) {
+  composerState.recipients = composerState.recipients.filter((item) => item !== email);
+  composerState.confirmExternal = false;
+  renderComposeRecipients();
+}
+
+function handleComposeDialogClick(event) {
+  const remove = event.target.closest("[data-remove-recipient]");
+  if (remove) {
+    removeComposeRecipient(remove.dataset.removeRecipient);
+    return;
+  }
+  const suggest = event.target.closest("[data-compose-suggest]");
+  if (suggest) addComposeRecipient(suggest.dataset.composeSuggest);
+}
+
+/* ---- Presets and sections ---- */
+
+function renderComposeSections() {
+  for (const input of composeSectionsContainer.querySelectorAll("input[data-section]")) {
+    input.checked = Boolean(composerState.sections[input.dataset.section]);
+  }
+}
+
+function updatePresetRadios() {
+  composePresetFullInput.checked = composerState.preset === "full";
+  composePresetClientSafeInput.checked = composerState.preset === "clientSafe";
+}
+
+function handleComposePresetChange(event) {
+  const input = event.target.closest("input[data-preset]");
+  if (!input || !input.checked) return;
+  applyComposePreset(input.dataset.preset);
+}
+
+// Mutates checkboxes to match composerState.includeIds without touching the Set itself
+// — for callers (a preset) that already replaced includeIds wholesale and just need the
+// 685 checkboxes to catch up, as opposed to setAllComposeTurns, which drives both.
+function syncAllComposeCheckboxes() {
+  for (const [id, row] of composeRows) {
+    row.checkbox.checked = composerState.includeIds.has(id);
+  }
+}
+
+function applyComposePreset(name) {
+  const preset = PRESETS[name];
+  if (!preset) return;
+  composerState.sections = { ...preset };
+  composerState.preset = name;
+  // "Full record" is the one preset that means every turn too — every other path
+  // through the turn list (individual toggles, All/None, drop-before/after) leaves
+  // includeIds exactly as the operator left it.
+  composerState.includeIds = name === "full" ? new Set(composeSegments.map((segment) => segment.id)) : new Set();
+  renderComposeSections();
+  updatePresetRadios();
+  syncAllComposeCheckboxes();
+  syncRawEvidenceGuard();
+  updateComposeTurnCount();
+}
+
+// Presets are starting points, not modes: any change the operator makes after picking
+// one — a section, a turn, a trim — leaves neither radio checked, because the selection
+// no longer matches what either preset would produce.
+function clearComposePresetMatch() {
+  composerState.preset = null;
+  updatePresetRadios();
+}
+
+function handleComposeSectionChange(event) {
+  const input = event.target.closest("input[data-section]");
+  if (!input) return;
+  composerState.sections[input.dataset.section] = input.checked;
+  clearComposePresetMatch();
+}
+
+// Ruling 4 (2026-08-27-notes-email-composer progress ledger): the renderer sends raw
+// evidence as every raw segment, unfiltered by which turns are selected. Left as-is
+// server-side — this dialog is where the combination gets closed off instead: raw
+// evidence is disabled outright unless canEnableRawEvidence says the selection could not
+// possibly diverge from it.
+//
+// That covers deselecting a turn AND editing one — editing is redaction too (see
+// compose-guard.js), so this must run after every mutation to either includeIds or
+// edits, not just includeIds. handleComposeTurnTextBlur is the one call site that
+// touches edits without also touching includeIds.
+function syncRawEvidenceGuard() {
+  const allIncluded = canEnableRawEvidence(composeSegments, composerState.includeIds, composerState.edits);
+  composeRawEvidenceInput.disabled = !allIncluded;
+  composeRawEvidenceChoice.classList.toggle("is-disabled", !allIncluded);
+  if (!allIncluded && composerState.sections.rawEvidence) {
+    composerState.sections.rawEvidence = false;
+    composeRawEvidenceInput.checked = false;
+  }
+  composeRawEvidenceHint.textContent = allIncluded
+    ? "Sends every raw segment verbatim — it ignores the turn selection below entirely."
+    : "Off while any turn below is deselected or edited: raw evidence ignores both, so it would still include a turn you just redacted.";
+  composeRawEvidenceHint.classList.toggle("is-warning", !allIncluded);
+}
+
+/* ---- Transcript turns ----
+   Built once when the dialog opens (buildComposeTurnList) and mutated node-by-node from
+   then on. A 685-turn meeting is thousands of DOM nodes; rebuilding that on every
+   checkbox click or keystroke is the one thing this section exists to avoid. */
+
+function buildComposeTurnList() {
+  const fragment = document.createDocumentFragment();
+  for (const segment of composeSegments) {
+    const row = document.createElement("div");
+    row.className = "compose-turn";
+    row.dataset.rowId = segment.id;
+
+    const checkLabel = document.createElement("label");
+    checkLabel.className = "compose-turn-check";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.dataset.turnCheck = "";
+    checkbox.checked = composerState.includeIds.has(segment.id);
+    checkLabel.append(checkbox);
+
+    const meta = document.createElement("span");
+    meta.className = "compose-turn-meta";
+    const time = document.createElement("button");
+    time.type = "button";
+    time.className = "compose-turn-time";
+    time.dataset.turnAnchor = "";
+    time.title = "Anchor here for Drop before / Drop after";
+    time.textContent = formatTime(segment.start);
+    const speaker = document.createElement("span");
+    speaker.className = "compose-turn-speaker";
+    speaker.textContent = segment.speaker;
+    meta.append(time, speaker);
+
+    // contenteditable rather than a mode toggle: clicking straight into the text is the
+    // click-to-edit, and :focus styling (see styles.css) is the only signal it needs.
+    const text = document.createElement("p");
+    text.className = "compose-turn-text";
+    text.dataset.turnText = "";
+    text.contentEditable = "true";
+    text.tabIndex = 0;
+    text.textContent = segment.text;
+
+    row.append(checkLabel, meta, text);
+    fragment.append(row);
+    composeRows.set(segment.id, { root: row, checkbox, text });
+  }
+  composeTurnListEl.replaceChildren(fragment);
+}
+
+function updateComposeTurnCount() {
+  composeTranscriptCount.textContent = composeSegments.length
+    ? `${composerState.includeIds.size} of ${composeSegments.length} selected`
+    : "No transcript available";
+}
+
+function handleComposeTurnCheckboxChange(event) {
+  const checkbox = event.target.closest("[data-turn-check]");
+  if (!checkbox) return;
+  const id = checkbox.closest("[data-row-id]")?.dataset.rowId;
+  if (!id) return;
+  toggleInSet(composerState.includeIds, id, checkbox.checked);
+  clearComposePresetMatch();
+  syncRawEvidenceGuard();
+  updateComposeTurnCount();
+}
+
+function handleComposeTurnListClick(event) {
+  const anchorButton = event.target.closest("[data-turn-anchor]");
+  if (!anchorButton) return;
+  const id = anchorButton.closest("[data-row-id]")?.dataset.rowId;
+  if (id) setComposeAnchor(id);
+}
+
+function setComposeAnchor(id) {
+  if (composeAnchorId) composeRows.get(composeAnchorId)?.root.classList.remove("is-anchor");
+  composeAnchorId = id;
+  composeRows.get(id)?.root.classList.add("is-anchor");
+  composeDropBeforeButton.disabled = false;
+  composeDropAfterButton.disabled = false;
+}
+
+function setAllComposeTurns(included) {
+  for (const segment of composeSegments) {
+    if (included) composerState.includeIds.add(segment.id);
+    else composerState.includeIds.delete(segment.id);
+    const row = composeRows.get(segment.id);
+    if (row) row.checkbox.checked = included;
+  }
+  clearComposePresetMatch();
+  syncRawEvidenceGuard();
+  updateComposeTurnCount();
+}
+
+// Trims around the anchored turn: "before" drops everything earlier and keeps the
+// anchor onward; "after" drops everything later and keeps up to the anchor. The anchor
+// row's own checked state is left exactly as it was — trimming decides a range, not
+// what happens to the one row it is measured from.
+function dropComposeTurnsRelativeToAnchor(direction) {
+  if (!composeAnchorId) return;
+  const anchorIndex = composeSegments.findIndex((segment) => segment.id === composeAnchorId);
+  if (anchorIndex === -1) return;
+  composeSegments.forEach((segment, index) => {
+    const shouldDrop = direction === "before" ? index < anchorIndex : index > anchorIndex;
+    if (!shouldDrop || !composerState.includeIds.delete(segment.id)) return;
+    const row = composeRows.get(segment.id);
+    if (row) row.checkbox.checked = false;
+  });
+  clearComposePresetMatch();
+  syncRawEvidenceGuard();
+  updateComposeTurnCount();
+}
+
+function handleComposeTurnTextKeydown(event) {
+  // A transcript turn is one line. Enter commits the edit instead of inserting a
+  // newline into what the recipient would otherwise read as a paragraph break.
+  if (event.key !== "Enter" || !event.target.closest("[data-turn-text]")) return;
+  event.preventDefault();
+  event.target.blur();
+}
+
+function handleComposeTurnTextBlur(event) {
+  const textEl = event.target.closest("[data-turn-text]");
+  if (!textEl) return;
+  const id = textEl.closest("[data-row-id]")?.dataset.rowId;
+  const segment = composeSegments.find((item) => item.id === id);
+  if (!id || !segment) return;
+
+  // SELECTION_LIMITS.turnEdit (notes-email-selection.js) is 2000 chars; the server
+  // clamps silently, but showing the operator the clamp here means the preview and the
+  // send agree with what they see on screen.
+  const edited = textEl.textContent.slice(0, 2000);
+  if (edited !== textEl.textContent) textEl.textContent = edited;
+
+  const row = composeRows.get(id);
+  if (edited === segment.text) {
+    composerState.edits.delete(id);
+    row?.root.classList.remove("is-edited");
+  } else {
+    // Stored even when empty: clearing a turn's text is a legitimate way to redact one
+    // line without dropping the turn entirely (notes-email-render.js).
+    composerState.edits.set(id, edited);
+    row?.root.classList.add("is-edited");
+  }
+  // This edit just changed composerState.edits without touching includeIds — the one
+  // mutation this dialog makes that the other five (checkbox, preset, select-all/none,
+  // drop-before/after) don't. Raw evidence has to react to an edit exactly as it reacts
+  // to deselection, or "[redacted]" in the transcript ships alongside the original
+  // sentence in raw evidence.
+  syncRawEvidenceGuard();
+}
+
+/* ---- Preview and send ---- */
+
+function updateComposeButtons() {
+  const blocked = composerState.busy || composerState.recipients.length === 0;
+  composePreviewButton.disabled = blocked;
+  composeSendButton.disabled = blocked;
+  composePreviewButton.textContent = composerState.inFlight === "preview" ? "Loading…" : "Preview";
+  composeSendButton.textContent = composerState.inFlight === "send" ? "Sending…" : "Send";
+}
+
+function renderComposeError() {
+  composeErrorEl.textContent = composerState.error;
+  composeErrorEl.hidden = !composerState.error;
+  composeConfirmExternalButton.hidden = !composerState.needsExternalConfirm;
+}
+
+function handleComposeSubmit(event) {
+  event.preventDefault();
+  void submitCompose(false);
+}
+
+function handleComposeConfirmExternal() {
+  composerState.confirmExternal = true;
+  void submitCompose(composerState.pendingPreview);
+}
+
+function buildComposePayload() {
+  return {
+    recipients: composerState.recipients,
+    confirmExternal: composerState.confirmExternal,
+    subject: composerState.subject,
+    intro: composerState.intro,
+    signoff: composerState.signoff,
+    sections: { ...composerState.sections },
+    transcript: {
+      includeIds: [...composerState.includeIds],
+      edits: Object.fromEntries(composerState.edits)
+    }
+  };
+}
+
+// Bypasses the shared api() helper deliberately: that helper collapses every error down
+// to a message string, and telling "external_not_confirmed" apart from
+// "meeting_not_completed" (both 409s) needs the error code the response actually sends.
+async function callNotesEmail(meetingId, payload, { preview }) {
+  const response = await fetch(
+    `/api/meetings/${encodeURIComponent(meetingId)}/notes-email${preview ? "?preview=1" : ""}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }
+  );
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body.message || "Request failed.");
+    error.status = response.status;
+    error.code = body.error || "";
+    throw error;
+  }
+  return body;
+}
+
+async function submitCompose(preview) {
+  if (composerState.busy) return;
+  if (!composerState.recipients.length) {
+    composerState.error = "Add at least one recipient.";
+    renderComposeError();
+    return;
+  }
+
+  const meetingId = composerState.meetingId;
+  // Minted fresh for this call and never reused — see the comment on composerState's
+  // activeRequestId. Whoever holds the matching id when the response comes back is the
+  // request the dialog is still waiting on; anyone else's response is stale and must not
+  // touch the dialog, even though it still has to finish the meeting-scoped bookkeeping
+  // below (reloadMeeting, sendingEmails) that isn't about the dialog at all.
+  const requestId = ++composeRequestSeq;
+  composerState.activeRequestId = requestId;
+  composerState.busy = true;
+  composerState.inFlight = preview ? "preview" : "send";
+  composerState.error = "";
+  composerState.needsExternalConfirm = false;
+  renderComposeError();
+  updateComposeButtons();
+  // Reflected on the meeting detail pane too, so the outer "Compose & send" button
+  // shows the same "Sending…" state a background poll would otherwise silently repaint.
+  if (!preview) {
+    state.sendingEmails.add(meetingId);
+    renderCache.detail = "";
+    renderDetail();
+  }
+
+  try {
+    const body = await callNotesEmail(meetingId, buildComposePayload(), { preview });
+    const isCurrentRequest = composerState.activeRequestId === requestId;
+    if (preview) {
+      // A stale preview response must not overwrite what is now a different (or newer)
+      // send's preview pane.
+      if (isCurrentRequest) {
+        composePreviewSubject.textContent = body.subject ? `Subject: ${body.subject}` : "";
+        composePreviewFrame.srcdoc = body.html || "";
+        composePreviewGroup.hidden = false;
+        composePreviewGroup.scrollIntoView({ block: "nearest", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+      }
+    } else {
+      // A stale send response must not close a dialog that has since moved on to a
+      // different composition — that send may still be genuinely in flight.
+      if (isCurrentRequest) composeDialog.close();
+      // Unconditional either way: this send genuinely happened (or failed) for
+      // meetingId, and that is true regardless of what the dialog is doing now.
+      await reloadMeeting(meetingId);
+    }
+  } catch (error) {
+    if (composerState.activeRequestId === requestId) {
+      composerState.error = error.message;
+      composerState.needsExternalConfirm = error.code === "external_not_confirmed";
+      composerState.pendingPreview = preview;
+      renderComposeError();
+    }
+  } finally {
+    // The actual fix for the duplicate-send race: only the request the dialog is still
+    // waiting on may release the busy guard. A meetingId check alone isn't enough here —
+    // a second send of the SAME meeting would share it with the first — which is why
+    // this compares the per-call token instead.
+    if (composerState.activeRequestId === requestId) {
+      composerState.busy = false;
+      composerState.inFlight = null;
+    }
+    if (!preview) {
+      state.sendingEmails.delete(meetingId);
+      renderCache.detail = "";
+      renderDetail();
+    }
+    updateComposeButtons();
+  }
+}
+
 /* ---------- Calendar view ---------- */
 
 const CAL_HOUR_PX = 56;
@@ -2963,12 +3617,10 @@ function startButtonLabel(meeting, running) {
   return "Record again";
 }
 
+// `sending` reflects a send actually in flight from inside the compose dialog (see
+// submitCompose), not the dialog merely being open — opening it makes no network call.
 function emailButtonLabel(meeting, sending) {
-  if (sending) return "Sending…";
-  const delivery = meeting.delivery?.transcriptEmail;
-  if (delivery?.status === "sent") return "Resend notes";
-  if (delivery?.status === "failed") return "Retry email";
-  return "Email notes";
+  return sending ? "Sending…" : "Compose & send";
 }
 
 function shortMeetUrl(value) {
