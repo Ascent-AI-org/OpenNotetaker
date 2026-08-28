@@ -48,6 +48,13 @@ export function renderNotesEmail({ meeting, selection }) {
   const decisions = selection.decisions ?? notes.decisions ?? [];
   const actionItems = selection.actionItems ?? notes.actionItems ?? [];
   const turns = s.transcript ? selectedTranscriptTurns(meeting, selection) : [];
+  // What actually went into this email, not what the request asked for — a caller can
+  // leave transcript.includeIds and transcript.edits populated while unticking the
+  // transcript section, and the audit record must not claim turns were sent (or edited)
+  // in an email that carries no transcript at all. Computed from `turns`, the same list
+  // the text and html below are built from, so this can only ever agree with the email.
+  const editsRequested = selection.transcript?.edits || {};
+  const turnsEditedRendered = turns.filter((turn) => Object.hasOwn(editsRequested, turn.id)).length;
 
   const text = [];
   if (selection.intro) text.push(selection.intro, "");
@@ -91,7 +98,7 @@ export function renderNotesEmail({ meeting, selection }) {
   // A ceiling on the whole rendered body. A 685-turn transcript is already tens of
   // thousands of characters, and a provider-side rejection tells the operator nothing they
   // can act on — fail here, naming the thing to deselect.
-  const body = { subject, text: text.join("\n"), html };
+  const body = { subject, text: text.join("\n"), html, turnsRendered: turns.length, turnsEditedRendered };
   if (body.text.length > MAX_BODY_CHARS || body.html.length > MAX_BODY_HTML_CHARS) {
     const error = new Error("The composed email is too large to send. Send fewer transcript turns.");
     error.code = "body_too_large";

@@ -114,6 +114,49 @@ test("refuses to render a body past the size ceiling", () => {
   assert.throws(() => renderNotesEmail({ meeting: huge, selection: sel }), /too large/);
 });
 
+test("turnsRendered and turnsEditedRendered are zero when the transcript section is off", () => {
+  // Finding B: sections.transcript can be false while transcript.includeIds/edits still
+  // carry values (the composer clears the section checkbox but leaves the turn
+  // selection). The audit record must not claim turns were sent, or edited, in an email
+  // that contains no transcript at all.
+  const sel = selection({
+    sections: { ...selection().sections, transcript: false },
+    transcript: { includeIds: ["s1", "s3"], edits: { s1: "Rewritten opening." } }
+  });
+  const out = renderNotesEmail({ meeting, selection: sel });
+  assert.doesNotMatch(out.text, /TRANSCRIPT/);
+  assert.equal(out.turnsRendered, 0);
+  assert.equal(out.turnsEditedRendered, 0);
+});
+
+test("turnsRendered and turnsEditedRendered count exactly what was rendered", () => {
+  const sel = selection({
+    sections: { ...selection().sections, transcript: true },
+    transcript: { includeIds: ["s1", "s3"], edits: { s1: "Rewritten opening." } }
+  });
+  const out = renderNotesEmail({ meeting, selection: sel });
+  assert.equal(out.turnsRendered, 2);
+  assert.equal(out.turnsEditedRendered, 1);
+});
+
+test("selectedTranscriptTurns dedupes a repeated id in includeIds", () => {
+  // A repeated id in the request must not inflate the turn count above what the
+  // recipient actually received — includeIds is attacker/client-controlled input.
+  const sel = selection({ transcript: { includeIds: ["s1", "s1", "s3"], edits: {} } });
+  const turns = selectedTranscriptTurns(meeting, sel);
+  assert.equal(turns.length, 2);
+  assert.deepEqual(turns.map((t) => t.id), ["s1", "s3"]);
+});
+
+test("an empty-string turn edit renders as empty, not the stored text", () => {
+  // The legitimate-redaction case: clearing a turn's text to "" must stick, not silently
+  // fall back to the original segment text just because the edited string is falsy.
+  const sel = selection({ transcript: { includeIds: ["s1"], edits: { s1: "" } } });
+  const turns = selectedTranscriptTurns(meeting, sel);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].text, "");
+});
+
 test("renders with no notes at all rather than throwing", () => {
   const bare = { id: "m2", title: "Bare", artifacts: {} };
   const out = renderNotesEmail({ meeting: bare, selection: selection({ sections: { ...selection().sections, summary: true, transcript: true } }) });

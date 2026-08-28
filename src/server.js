@@ -79,7 +79,7 @@ import {
 } from "./domain/export.js";
 import { buildTranscriptEmail } from "./domain/transcript-email.js";
 import { parseNotesEmailSelection } from "./domain/notes-email-selection.js";
-import { renderNotesEmail, selectedTranscriptTurns } from "./domain/notes-email-render.js";
+import { renderNotesEmail } from "./domain/notes-email-render.js";
 import {
   CALENDAR_READONLY_SCOPE,
   GMAIL_SEND_SCOPE,
@@ -1274,11 +1274,14 @@ async function route(request, response) {
           recipients: parsed.value.recipients,
           subject: rendered.subject,
           sections: parsed.value.sections,
-          // Deduped by which segments actually ended up in the rendered email, not the
-          // raw includeIds count — a repeated id in the request must not inflate the
-          // audit count above what the recipient actually received.
-          turnsSent: selectedTranscriptTurns(meeting, parsed.value).length,
-          turnsEdited: Object.keys(parsed.value.transcript.edits).length,
+          // Read from what renderNotesEmail actually put in the email, not recomputed
+          // here from the selection: sections.transcript can be off while
+          // transcript.includeIds/edits still carry values (the UI clears the section
+          // but leaves them), and recomputing independently is exactly the
+          // two-definitions-drift that notes-sections.js was extracted to prevent one
+          // level down — recreating it at this layer would defeat the point.
+          turnsSent: rendered.turnsRendered,
+          turnsEdited: rendered.turnsEditedRendered,
           providerMessageIds,
           failedRecipients
         }
