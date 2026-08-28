@@ -274,11 +274,13 @@ send and never touch the stored meeting record.
 
 - [ ] **NC-01 — Preview output matches the delivered email** 🔴 *blocker if it fails*
   - **Do:** Open Compose & send, choose a template, make edits to sections and turns,
-    then press **Preview**. Note the exact output. Then press **Send now** to a real
+    then press **Preview**. Note the exact output. Then press **Send** to a real
     address and open the inbox.
-  - **Expect:** The email in the inbox is pixel-for-pixel identical to the preview —
-    same sections, same edited turn text, same section order. The preview and send use
-    the same renderer so they cannot drift.
+  - **Expect:** Same sections, same edited turn text, and same section order in the
+    inbox as in the preview — the preview and send use the same renderer so content and
+    order cannot drift. Do not expect the two to be pixel-for-pixel identical: the
+    preview renders inside an iframe under this app's stylesheet, and a real inbox
+    applies its own CSS on top, so markup and appearance will legitimately differ.
 - [ ] **NC-02 — A deselected transcript turn is absent from the sent email** 🔴 *blocker if it fails*
   - **Do:** In Compose & send, open the transcript, deselect at least one turn, then
     send to yourself and open the inbox.
@@ -292,11 +294,12 @@ send and never touch the stored meeting record.
     permanent change has been made.
 - [ ] **NC-04 — An external recipient is refused until confirmed** 🔴 *blocker if it fails*
   - **Do:** In Compose & send, type an address on a different domain (e.g. if your
-    connected domains are @company.com, type anything@external.org), then press **Send
-    now** without confirming the warning.
-  - **Expect:** A confirmation dialog appears *before* the send, naming that address and
-    asking you to confirm. Pressing cancel sends nothing. Confirming the warning makes
-    the send go through.
+    connected domains are @company.com, type anything@external.org), then press **Send**
+    without confirming the warning.
+  - **Expect:** There is no confirmation dialog. The send is attempted, the server
+    answers 409, and an inline error naming that address appears next to a **Confirm &
+    continue** button. Nothing has been sent at this point. Pressing **Confirm &
+    continue** resubmits the same send and it goes through.
 - [ ] **NC-05 — Section toggles control what is sent**
   - **Do:** Compose & send, toggle off summary, decisions, and risks. Leave on action
     items and transcript only. Send and open the inbox.
