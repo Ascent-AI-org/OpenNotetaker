@@ -2410,6 +2410,15 @@ details.section-fold > .fold-body {
 .dialog-compose {
   width: min(760px, calc(100vw - 32px));
   max-height: min(92vh, calc(100vh - 20px));
+}
+
+/* Scoped to [open], and it has to be. The browser hides a closed dialog with
+   `dialog:not([open]) { display: none }` in its own stylesheet, which any author rule
+   carrying a class outranks — so declaring `display: flex` on .dialog-compose kept the
+   dialog painted after close() had already set open=false. It looked like Close was
+   broken; the dialog was shut and still on screen. Every other dialog here avoids this by
+   never declaring display at all (see .dialog), so add layout under [open] or not at all. */
+.dialog-compose[open] {
   display: flex;
   flex-direction: column;
 }
