@@ -164,6 +164,18 @@ test("__proto__ in transcript.edits does not appear as a key and does not throw"
   assert.equal(keys.every((k) => ["seg-1", "seg-2"].includes(k)), true);
 });
 
+test("decisions is capped at MAX_ACTION_ITEMS entries, not just clamped per-item", () => {
+  // Finding C: only the per-item length was bounded. Without an array cap, a stolen
+  // session could POST hundreds of items at the per-item clamp and have this app mail
+  // ~400KB of attacker-authored prose from the owner's Gmail — the exact thing the
+  // spec's threat model claims a compromised session "cannot" do.
+  const many = Array.from({ length: 250 }, (_, i) => `decision ${i}`);
+  const r = parseNotesEmailSelection({ ...base, decisions: many }, meeting, { ownerDomains: ["b.com"] });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.decisions.length, 200);
+  assert.deepEqual(r.value.decisions, many.slice(0, 200));
+});
+
 test("isExternalRecipient compares domains case-insensitively", () => {
   assert.equal(isExternalRecipient("a@B.com", ["b.com"]), false);
   assert.equal(isExternalRecipient("a@other.com", ["b.com"]), true);

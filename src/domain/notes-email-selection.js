@@ -8,7 +8,7 @@
 // Pure on purpose. Deciding who receives mail and what it contains is the one mistake in
 // this area that cannot be taken back, so it is testable without sending anything.
 import { MAX_RECIPIENTS } from "./note-delivery.js";
-import { parseActionItems } from "./action-items.js";
+import { parseActionItems, MAX_ACTION_ITEMS } from "./action-items.js";
 
 export const SECTION_KEYS = [
   "summary",
@@ -98,8 +98,14 @@ export function parseNotesEmailSelection(body, meeting, { ownerDomains = [] } = 
       signoff: clamp(body.signoff, SELECTION_LIMITS.signoff),
       sections,
       summaryOverride: body.summaryOverride === undefined ? null : clamp(body.summaryOverride, SELECTION_LIMITS.summary),
+      // Count-capped like every other bulk collection this module accepts (recipients at
+      // MAX_RECIPIENTS, action items at MAX_ACTION_ITEMS, evidenceSegmentIds at 20) —
+      // decisions was the one gap. Without this, a stolen session could POST hundreds of
+      // items at the per-item clamp and have this app mail attacker-authored prose from
+      // the owner's Gmail, which is exactly what the spec's threat model claims a
+      // compromised session "cannot" do.
       decisions: Array.isArray(body.decisions)
-        ? body.decisions.map((item) => clamp(item, SELECTION_LIMITS.turnEdit)).filter(Boolean)
+        ? body.decisions.slice(0, MAX_ACTION_ITEMS).map((item) => clamp(item, SELECTION_LIMITS.turnEdit)).filter(Boolean)
         : null,
       actionItems,
       transcript: { includeIds: rawIncludeIds, edits }
