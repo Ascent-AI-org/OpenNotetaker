@@ -215,7 +215,10 @@ you trim the transcript quickly.
 suggestion chips below, with anyone outside your connected Google domains marked
 ⚠ and highlighted in amber. Clicking a chip adds them; they persist until you remove
 them. Sending to an outside address asks for confirmation — the server enforces this
-before the email is sent, so there is no path to accidentally send outside the company.
+before the email is sent, so a recipient outside your connected domains is flagged and
+requires that confirmation rather than going out silently. That check is only as
+precise as "connected domain": if you signed up with a freemail address, your own
+domain (e.g. gmail.com) is treated as internal, and so is every other recipient on it.
 
 **Preview.** Before sending, press **Preview** to see the exact email that will be
 delivered — same formatting, same sections, same edited turns. The preview uses the
