@@ -993,7 +993,7 @@ function renderList() {
   const cacheKey = JSON.stringify([
     state.selectedId,
     state.listScope,
-    state.meetings.map((meeting) => [meeting.id, meeting.status, meeting.title, meeting.scheduledAt, meeting.statusMessage, meeting.artifacts?.notes?.actionItems?.length, meeting.isMine, meeting.visibility, ownerLabel(meeting)])
+    state.meetings.map((meeting) => [meeting.id, meeting.status, meeting.title, meeting.scheduledAt, meeting.statusMessage, meeting.artifacts?.notes?.actionItems?.length ?? meeting.artifacts?.actionItemCount, meeting.isMine, meeting.visibility, ownerLabel(meeting)])
   ]);
   if (cacheKey === renderCache.list) return;
   renderCache.list = cacheKey;
@@ -1058,7 +1058,8 @@ function renderScopeFilter() {
 function renderMeetingCard(meeting) {
   const meta = STATUS_META[meeting.status] || { label: meeting.status, tone: "muted" };
   const active = meeting.id === state.selectedId ? " active" : "";
-  const actionCount = meeting.artifacts?.notes?.actionItems?.length || 0;
+  // The list carries a count; a meeting already fetched in full carries the items.
+  const actionCount = meeting.artifacts?.notes?.actionItems?.length ?? meeting.artifacts?.actionItemCount ?? 0;
   // Quiet rows: the icon carries status; a sub-line appears only when something is
   // actually happening, or to surface the action count on finished meetings.
   const sub =
@@ -1787,11 +1788,14 @@ async function setMeetingVisibility(meeting, visibility) {
   renderCache.detail = "";
   renderDetail();
   try {
-    await api(`/api/meetings/${meeting.id}`, {
+    // The PATCH answers with the saved meeting, so the switch settles on that rather than
+    // on a full list refresh: the list is ~1.7MB on a busy install and the button would
+    // sit on "Saving…" for the length of that download, long after the save had landed.
+    const { meeting: saved } = await api(`/api/meetings/${meeting.id}`, {
       method: "PATCH",
       body: JSON.stringify({ visibility })
     });
-    await refresh();
+    replaceMeeting(saved);
   } catch (error) {
     setAppError(error.message);
   } finally {

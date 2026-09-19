@@ -3047,7 +3047,11 @@ function summarizeMeeting(meeting) {
     ...rest,
     eventCount: events?.length ?? 0,
     artifacts: {
-      notes: artifacts?.notes ?? null,
+      // The summary, decisions and every action item's text used to ride along here for
+      // all 352 meetings: 1.2MB of the 1.7MB this route sent every 1.8s, to render one
+      // number per row. The detail view fetches the meeting itself and has the real notes.
+      notes: null,
+      actionItemCount: artifacts?.notes?.actionItems?.length ?? 0,
       reconstructedTranscript: null,
       rawSegmentCount: artifacts?.rawSegments?.length ?? 0,
       normalizedSegmentCount: artifacts?.normalizedSegments?.length ?? 0

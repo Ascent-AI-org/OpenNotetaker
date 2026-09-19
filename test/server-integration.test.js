@@ -519,3 +519,47 @@ test("sharing is rejected for anything but the two known visibilities", async (t
   const unchanged = await fetch(`${server.baseUrl}/api/meetings/${meeting.id}`, { headers: { Cookie: owner } });
   assert.equal((await unchanged.json()).meeting.visibility, "private");
 });
+
+test("the meeting list sends an action-item count, not the notes themselves", async (t) => {
+  // The list is re-fetched every 1.8s by every open tab. It renders one number per row
+  // from the notes, so shipping the summary, decisions and every action item's text made
+  // up 1.2MB of a 1.7MB response — and made a save that waited on a refresh feel stuck.
+  const server = await startServer();
+  t.after(() => server.stop());
+
+  const owner = await signUp(server.baseUrl, "owner@example.com");
+  const meeting = await createMeeting(server.baseUrl, owner);
+
+  const finalized = await fetch(`${server.baseUrl}/api/runner/meetings/${meeting.id}/raw-transcript`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${RUNNER_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      rawSegments: Array.from({ length: 6 }, (_, index) => ({
+        id: `seg-${index}`,
+        speaker: "Speaker 1",
+        start: index * 5,
+        end: index * 5 + 5,
+        text: "kal tak update bhejna hai, baaki sab theek hai"
+      }))
+    })
+  });
+  assert.equal(finalized.status, 202, await finalized.text());
+
+  // The pipeline finishes asynchronously; wait for the notes to land.
+  let full = null;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    full = (await (await fetch(`${server.baseUrl}/api/meetings/${meeting.id}`, { headers: { Cookie: owner } })).json()).meeting;
+    if (full.artifacts?.notes) break;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  assert.ok(full.artifacts?.notes, "the detail route still carries the real notes");
+
+  const listed = (await (await fetch(`${server.baseUrl}/api/meetings`, { headers: { Cookie: owner } })).json()).meetings[0];
+  assert.equal(listed.artifacts.notes, null, "no note bodies in the list");
+  assert.equal(
+    listed.artifacts.actionItemCount,
+    full.artifacts.notes.actionItems.length,
+    "but the count the rows render is there"
+  );
+  assert.equal(JSON.stringify(listed).includes(full.artifacts.notes.summary.slice(0, 40)), false, "no summary text either");
+});
