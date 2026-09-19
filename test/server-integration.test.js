@@ -396,3 +396,126 @@ test("a spent account budget locks the account out for the window, owner include
   });
   assert.equal(bystander.status, 200, "other accounts are unaffected");
 });
+
+/* ---------- Sharing a meeting with the team ---------- */
+
+async function setVisibility(baseUrl, cookie, meetingId, visibility) {
+  return fetch(`${baseUrl}/api/meetings/${meetingId}`, {
+    method: "PATCH",
+    headers: { Cookie: cookie, "Content-Type": "application/json", Origin: baseUrl },
+    body: JSON.stringify({ visibility })
+  });
+}
+
+test("a meeting is private until its owner shares it, and readable by the team after", async (t) => {
+  const server = await startServer();
+  t.after(() => server.stop());
+
+  const owner = await signUp(server.baseUrl, "owner@example.com");
+  const teammate = await signUp(server.baseUrl, "teammate@example.com");
+  const meeting = await createMeeting(server.baseUrl, owner, "Engg Standup");
+
+  assert.equal(meeting.visibility, "private", "a new meeting starts private");
+
+  const beforeRead = await fetch(`${server.baseUrl}/api/meetings/${meeting.id}`, { headers: { Cookie: teammate } });
+  assert.equal(beforeRead.status, 404, "a private meeting is not even confirmed to exist");
+
+  const shared = await setVisibility(server.baseUrl, owner, meeting.id, "team");
+  assert.equal(shared.status, 200);
+  assert.equal((await shared.json()).meeting.visibility, "team");
+
+  const afterRead = await fetch(`${server.baseUrl}/api/meetings/${meeting.id}`, { headers: { Cookie: teammate } });
+  assert.equal(afterRead.status, 200, "the teammate can now read it");
+  const seen = (await afterRead.json()).meeting;
+  assert.equal(seen.title, "Engg Standup");
+  assert.equal(seen.isMine, false, "the client is told this is not theirs to edit");
+  assert.equal(seen.owner.email, "owner@example.com", "and who to ask about it");
+
+  const listed = await (await fetch(`${server.baseUrl}/api/meetings`, { headers: { Cookie: teammate } })).json();
+  assert.deepEqual(listed.meetings.map((item) => item.id), [meeting.id]);
+  assert.equal(listed.meetings[0].isMine, false);
+
+  const ownersOwnList = await (await fetch(`${server.baseUrl}/api/meetings`, { headers: { Cookie: owner } })).json();
+  assert.equal(ownersOwnList.meetings[0].isMine, true);
+});
+
+test("unsharing hides the meeting again, including its recording", async (t) => {
+  const server = await startServer();
+  t.after(() => server.stop());
+
+  const owner = await signUp(server.baseUrl, "owner@example.com");
+  const teammate = await signUp(server.baseUrl, "teammate@example.com");
+  const meeting = await createMeeting(server.baseUrl, owner);
+
+  await setVisibility(server.baseUrl, owner, meeting.id, "team");
+  assert.equal(
+    (await fetch(`${server.baseUrl}/api/meetings/${meeting.id}/clips`, { headers: { Cookie: teammate } })).status,
+    200,
+    "clips of a shared meeting are listable"
+  );
+
+  const unshared = await setVisibility(server.baseUrl, owner, meeting.id, "private");
+  assert.equal((await unshared.json()).meeting.visibility, "private");
+
+  for (const path of ["", "/video", "/clips"]) {
+    const response = await fetch(`${server.baseUrl}/api/meetings/${meeting.id}${path}`, { headers: { Cookie: teammate } });
+    assert.equal(response.status, 404, `${path || "/"} is closed again`);
+  }
+
+  const listed = await (await fetch(`${server.baseUrl}/api/meetings`, { headers: { Cookie: teammate } })).json();
+  assert.deepEqual(listed.meetings, []);
+});
+
+test("a shared meeting is read-only: every write still belongs to its owner", async (t) => {
+  const server = await startServer();
+  t.after(() => server.stop());
+
+  const owner = await signUp(server.baseUrl, "owner@example.com");
+  const teammate = await signUp(server.baseUrl, "teammate@example.com");
+  const meeting = await createMeeting(server.baseUrl, owner);
+  await setVisibility(server.baseUrl, owner, meeting.id, "team");
+
+  const writes = [
+    ["PATCH", "", { recordVideo: false }],
+    ["POST", "/start", {}],
+    ["PUT", "/action-items", { actionItems: [] }],
+    ["PATCH", "/action-items/delivery", { recipients: "someone@example.com" }],
+    ["POST", "/send-action-items", {}],
+    ["POST", "/email-transcript", {}],
+    ["POST", "/notes-email", { sections: [] }],
+    ["POST", "/clips", { startSeconds: 0, endSeconds: 5 }]
+  ];
+
+  for (const [method, path, body] of writes) {
+    const response = await fetch(`${server.baseUrl}/api/meetings/${meeting.id}${path}`, {
+      method,
+      headers: { Cookie: teammate, "Content-Type": "application/json", Origin: server.baseUrl },
+      body: JSON.stringify(body)
+    });
+    assert.equal(response.status, 404, `${method} ${path || "/"} is refused for a teammate`);
+  }
+
+  // The sharing switch itself is a write: a teammate must not be able to un-share, nor to
+  // share someone else's private meeting with everyone.
+  const teammateUnshare = await setVisibility(server.baseUrl, teammate, meeting.id, "private");
+  assert.equal(teammateUnshare.status, 404);
+
+  const stillShared = await fetch(`${server.baseUrl}/api/meetings/${meeting.id}`, { headers: { Cookie: teammate } });
+  assert.equal((await stillShared.json()).meeting.visibility, "team", "the teammate's attempt changed nothing");
+});
+
+test("sharing is rejected for anything but the two known visibilities", async (t) => {
+  const server = await startServer();
+  t.after(() => server.stop());
+
+  const owner = await signUp(server.baseUrl, "owner@example.com");
+  const meeting = await createMeeting(server.baseUrl, owner);
+
+  for (const bad of ["public", "everyone", "TEAM", "", 1, null]) {
+    const response = await setVisibility(server.baseUrl, owner, meeting.id, bad);
+    assert.equal(response.status, 400, `rejects ${JSON.stringify(bad)}`);
+  }
+
+  const unchanged = await fetch(`${server.baseUrl}/api/meetings/${meeting.id}`, { headers: { Cookie: owner } });
+  assert.equal((await unchanged.json()).meeting.visibility, "private");
+});
