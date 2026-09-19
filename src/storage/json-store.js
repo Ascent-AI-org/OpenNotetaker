@@ -58,6 +58,9 @@ export class JsonStore {
       scheduledAt: input.scheduledAt,
       consentMode: input.consentMode,
       retentionDays: input.retentionDays,
+      // Private until its owner shares it. Stored explicitly so the record says what it
+      // is, rather than leaning on a reader's default for a missing field.
+      visibility: "private",
       status: "scheduled",
       statusMessage: "Waiting for the bot runner.",
       createdAt: new Date().toISOString(),

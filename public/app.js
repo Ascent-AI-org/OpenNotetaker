@@ -14,10 +14,15 @@ const state = {
   actionItemDrafts: new Map(),
   editingActionItems: null,
   selectedId: null,
+  // "all" | "mine" | "shared" — which owners' meetings the list shows. Only offered once
+  // a teammate has actually shared something, so a solo install never sees it.
+  listScope: "all",
   view: "detail", // "detail" | "calendar"
   weekOffset: 0,
   pollTimer: null,
   runningStarts: new Set(),
+  // Meeting ids whose share switch is mid-flight, so the poll cannot re-render it back.
+  sharing: new Set(),
   sendingEmails: new Set(),
   syncingCalendar: false,
   openFolds: new Set(["transcript"]),
@@ -303,6 +308,13 @@ detail.addEventListener(
 
 // Meeting selection via event delegation: the list re-renders on every data change.
 meetingList.addEventListener("click", (event) => {
+  const scopeTab = event.target.closest("[data-list-scope]");
+  if (scopeTab) {
+    state.listScope = scopeTab.dataset.listScope;
+    renderCache.list = "";
+    renderList();
+    return;
+  }
   const card = event.target.closest(".meeting-card");
   if (!card) return;
   selectMeeting(card.dataset.id);
@@ -447,6 +459,39 @@ function shiftWeek(delta, reset = false) {
   renderCalendar();
 }
 
+// A meeting a teammate shared is read-only here. The server refuses the writes either
+// way; this is what keeps a dead button from being offered in the first place.
+// Absent isMine means the payload predates sharing or came from an older route: treated as
+// not editable, so the failure mode is a missing button, never a write that 404s.
+function canEditMeeting(meeting) {
+  return meeting?.isMine === true;
+}
+
+function isSharedByTeammate(meeting) {
+  return meeting?.isMine === false;
+}
+
+function selectedMeeting() {
+  return (state.meetings || []).find((item) => item.id === state.selectedId) || null;
+}
+
+function canEditSelected() {
+  return canEditMeeting(selectedMeeting());
+}
+
+function ownerLabel(meeting) {
+  const owner = meeting?.owner;
+  if (!owner) return "A teammate";
+  return owner.name?.trim() || owner.email || "A teammate";
+}
+
+function scopedMeetings() {
+  const meetings = state.meetings || [];
+  if (state.listScope === "mine") return meetings.filter(canEditMeeting);
+  if (state.listScope === "shared") return meetings.filter(isSharedByTeammate);
+  return meetings;
+}
+
 function groupedMeetings() {
   const groups = [
     { label: "In progress", filter: (m) => !["scheduled", "completed", "failed"].includes(m.status) },
@@ -454,7 +499,7 @@ function groupedMeetings() {
     { label: "History", filter: (m) => ["completed", "failed"].includes(m.status) }
   ];
   return groups
-    .map(({ label, filter }) => ({ label, items: (state.meetings || []).filter(filter) }))
+    .map(({ label, filter }) => ({ label, items: scopedMeetings().filter(filter) }))
     .filter(({ items }) => items.length);
 }
 
@@ -947,10 +992,13 @@ function renderList() {
 
   const cacheKey = JSON.stringify([
     state.selectedId,
-    state.meetings.map((meeting) => [meeting.id, meeting.status, meeting.title, meeting.scheduledAt, meeting.statusMessage, meeting.artifacts?.notes?.actionItems?.length])
+    state.listScope,
+    state.meetings.map((meeting) => [meeting.id, meeting.status, meeting.title, meeting.scheduledAt, meeting.statusMessage, meeting.artifacts?.notes?.actionItems?.length, meeting.isMine, meeting.visibility, ownerLabel(meeting)])
   ]);
   if (cacheKey === renderCache.list) return;
   renderCache.list = cacheKey;
+
+  const scopeFilter = renderScopeFilter();
 
   if (!state.meetings.length) {
     meetingList.innerHTML = `
@@ -962,14 +1010,49 @@ function renderList() {
     return;
   }
 
-  meetingList.innerHTML = groupedMeetings()
-    .map(
-      ({ label, items }) => `
-        <p class="list-group-label">${label}</p>
-        ${items.map(renderMeetingCard).join("")}
-      `
-    )
-    .join("");
+  const groups = groupedMeetings();
+  meetingList.innerHTML = `
+    ${scopeFilter}
+    ${
+      groups.length
+        ? groups
+            .map(
+              ({ label, items }) => `
+                <p class="list-group-label">${label}</p>
+                ${items.map(renderMeetingCard).join("")}
+              `
+            )
+            .join("")
+        : `<p class="list-empty-note">${
+            state.listScope === "shared"
+              ? "No meetings shared with you yet."
+              : "No meetings of your own yet."
+          }</p>`
+    }
+  `;
+}
+
+// Offered only once someone has shared a meeting with you: until then every meeting in the
+// list is yours and the filter would be three tabs over one bucket.
+function renderScopeFilter() {
+  if (!(state.meetings || []).some(isSharedByTeammate)) return "";
+  const tabs = [
+    { id: "all", label: "All" },
+    { id: "mine", label: "Mine" },
+    { id: "shared", label: "Shared" }
+  ];
+  return `
+    <div class="list-scope" role="tablist" aria-label="Whose meetings to show">
+      ${tabs
+        .map(
+          (tab) => `
+            <button type="button" role="tab" class="list-scope-tab${state.listScope === tab.id ? " active" : ""}"
+                    aria-selected="${state.listScope === tab.id ? "true" : "false"}" data-list-scope="${tab.id}">${tab.label}</button>
+          `
+        )
+        .join("")}
+    </div>
+  `;
 }
 
 function renderMeetingCard(meeting) {
@@ -985,6 +1068,14 @@ function renderMeetingCard(meeting) {
         ? meta.label
         : "";
 
+  // Whose meeting this is belongs on the row itself: a teammate's shared standup and your
+  // own otherwise look identical, and the difference decides what you can do with it.
+  const ownerTag = isSharedByTeammate(meeting)
+    ? `<span class="card-tag">${escapeHtml(ownerLabel(meeting))}</span>`
+    : meeting.visibility === "team"
+      ? `<span class="card-tag subtle">Shared</span>`
+      : "";
+
   return `
     <button type="button" class="meeting-card${active}" data-id="${escapeHtml(meeting.id)}">
       <span class="meeting-card-top">
@@ -992,7 +1083,7 @@ function renderMeetingCard(meeting) {
         <span class="meeting-card-title">${escapeHtml(meeting.title)}</span>
         <span class="meeting-card-time">${escapeHtml(formatDayTime(meeting.scheduledAt))}</span>
       </span>
-      ${sub ? `<span class="meeting-card-sub">${escapeHtml(sub)}</span>` : ""}
+      ${sub || ownerTag ? `<span class="meeting-card-sub">${sub ? escapeHtml(sub) : ""}${ownerTag}</span>` : ""}
     </button>
   `;
 }
@@ -1023,8 +1114,10 @@ function renderExportControl() {
 }
 
 function renderExportPanel() {
-  const meetings = state.meetings || [];
-  const hasSelection = Boolean(state.selectedId);
+  // Only your own meetings are exportable, so the panel counts and lists only those —
+  // offering a teammate's shared meeting here would promise a file the server refuses.
+  const meetings = (state.meetings || []).filter(canEditMeeting);
+  const hasSelection = Boolean(state.selectedId) && canEditSelected();
   const { scope, sections, format, picked } = state.export;
 
   return `
@@ -1228,8 +1321,11 @@ async function runExport() {
 
 function exportScopeIds() {
   if (state.export.scope === "all") return "all";
-  if (state.export.scope === "pick") return [...state.export.picked];
-  return [state.selectedId];
+  // Export is yours alone: a teammate's shared meeting is readable but not exportable, and
+  // one of their ids in the list would fail the whole export rather than be skipped.
+  const mine = (id) => canEditMeeting((state.meetings || []).find((item) => item.id === id));
+  if (state.export.scope === "pick") return [...state.export.picked].filter(mine);
+  return [state.selectedId].filter(mine);
 }
 
 function filenameFromResponse(response) {
@@ -1264,6 +1360,7 @@ function renderDetail() {
         state.editingActionItems,
         state.editingActionItems === meeting.id ? state.actionItemDrafts.get(meeting.id) : null,
         videoFeature().enabled,
+        state.sharing.has(meeting.id),
         [...state.openClips],
         // Keys only. A share URL is a bearer credential; it has no business being
         // stringified into a cache key that lives on in memory.
@@ -1317,15 +1414,27 @@ function renderDetail() {
         <div class="doc-title-row">
           <h2>${escapeHtml(meeting.title)}</h2>
           <div class="head-actions">
-            <button id="email-button" class="btn btn-secondary" type="button" ${canEmailTranscript(meeting) && !sendingEmail ? "" : "disabled"}>
-              ${emailButtonLabel(meeting, sendingEmail)}
-            </button>
-            <button id="start-button" class="btn btn-primary" type="button" ${isRunnable(meeting) && !running ? "" : "disabled"}>
-              ${startButtonLabel(meeting, running)}
-            </button>
+            ${
+              canEditMeeting(meeting)
+                ? `
+                  ${renderShareSwitch(meeting)}
+                  <button id="email-button" class="btn btn-secondary" type="button" ${canEmailTranscript(meeting) && !sendingEmail ? "" : "disabled"}>
+                    ${emailButtonLabel(meeting, sendingEmail)}
+                  </button>
+                  <button id="start-button" class="btn btn-primary" type="button" ${isRunnable(meeting) && !running ? "" : "disabled"}>
+                    ${startButtonLabel(meeting, running)}
+                  </button>
+                `
+                : ""
+            }
           </div>
         </div>
         <div class="prop-row">
+          ${
+            isSharedByTeammate(meeting)
+              ? `<span class="prop-chip shared-by">Shared by ${escapeHtml(ownerLabel(meeting))} · read-only</span>`
+              : ""
+          }
           <span class="prop-chip">${statusIcon(meeting.status)}${escapeHtml(meta.label)}</span>
           <span class="prop-chip">${escapeHtml(formatDayTime(meeting.scheduledAt))}</span>
           ${
@@ -1335,7 +1444,7 @@ function renderDetail() {
           }
           ${renderDurationMeta(meeting)}
         </div>
-        ${renderDeliveryNote(meeting)}
+        ${canEditMeeting(meeting) ? renderDeliveryNote(meeting) : ""}
       </header>
 
       ${renderStatusBanner(meeting)}
@@ -1659,6 +1768,39 @@ function renderStatusBanner(meeting) {
   return "";
 }
 
+// The owner's one control over who else can read this meeting. Two states, no menu: it is
+// either private to them or readable by every signed-in teammate.
+function renderShareSwitch(meeting) {
+  const shared = meeting.visibility === "team";
+  const busy = state.sharing.has(meeting.id);
+  return `
+    <button class="btn ${shared ? "btn-secondary" : "btn-ghost"}" type="button"
+            data-share-meeting="${shared ? "private" : "team"}" ${busy ? "disabled" : ""}
+            title="${shared ? "Every teammate can read this meeting" : "Only you can read this meeting"}">
+      ${busy ? "Saving…" : shared ? "Shared with team" : "Share with team"}
+    </button>
+  `;
+}
+
+async function setMeetingVisibility(meeting, visibility) {
+  state.sharing.add(meeting.id);
+  renderCache.detail = "";
+  renderDetail();
+  try {
+    await api(`/api/meetings/${meeting.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ visibility })
+    });
+    await refresh();
+  } catch (error) {
+    setAppError(error.message);
+  } finally {
+    state.sharing.delete(meeting.id);
+    renderCache.detail = "";
+    renderDetail();
+  }
+}
+
 function renderNotes(notes, meeting) {
   const actionItems = notes.actionItems || [];
   const triage = [
@@ -1675,7 +1817,7 @@ function renderNotes(notes, meeting) {
       <div class="sec-label-row">
         <div class="sec-label">Action items <span class="sec-count">${rows.length}</span></div>
         ${
-          meeting?.status === "completed"
+          meeting?.status === "completed" && canEditMeeting(meeting)
             ? editing
               ? `<div class="sec-actions">
                    <button class="btn btn-ghost btn-sm" type="button" data-items-cancel>Cancel</button>
@@ -1715,7 +1857,7 @@ function renderNotes(notes, meeting) {
               </div>`
             : `<p class="muted-note">No commitments were made in this meeting.</p>`
       }
-      ${editing ? "" : renderActionItemDelivery(meeting, rows)}
+      ${editing || !canEditMeeting(meeting) ? "" : renderActionItemDelivery(meeting, rows)}
     </section>
 
     <section class="doc-section">
@@ -1872,7 +2014,8 @@ function renderVideo(meeting) {
   const clips = meeting.clips || [];
   const ready = video.status === "ready";
   const source = `/api/meetings/${encodeURIComponent(meeting.id)}/video`;
-  const toggle = canToggleRecording(meeting)
+  const editable = canEditMeeting(meeting);
+  const toggle = editable && canToggleRecording(meeting)
     ? `<button class="btn btn-secondary btn-sm" type="button" data-video-toggle="${video.enabled ? "off" : "on"}">${
         video.enabled ? "Don't record video" : "Record video"
       }</button>`
@@ -1889,7 +2032,7 @@ function renderVideo(meeting) {
           ready
             ? `<div class="sec-actions">
                  <span class="video-meta">${escapeHtml(videoMetaText(video))}</span>
-                 <button class="btn btn-secondary btn-sm" type="button" data-clip-here>Clip this moment</button>
+                 ${editable ? `<button class="btn btn-secondary btn-sm" type="button" data-clip-here>Clip this moment</button>` : ""}
                </div>`
             : toggle && `<div class="sec-actions">${toggle}</div>`
         }
@@ -1972,6 +2115,7 @@ function renderEvidenceControls(meeting, item) {
   if (!videoPlayable(meeting)) return escapeHtml(stamp);
   const moment = evidenceMoment(meeting, item);
   if (!moment) return escapeHtml(stamp);
+  if (!canEditMeeting(meeting)) return renderSeekTime(moment.start, true);
   return `
     <div class="evidence-actions">
       ${renderSeekTime(moment.start, true)}
@@ -2040,8 +2184,14 @@ function renderClip(meeting, clip) {
           <button type="button" class="btn btn-ghost btn-sm" data-clip-toggle aria-expanded="${open ? "true" : "false"}">
             ${open ? "Hide" : "Play"}
           </button>
-          ${shareActive(clip.share) ? "" : renderShareControl(clip)}
-          <button type="button" class="btn btn-ghost btn-sm clip-destructive" data-clip-delete>Delete</button>
+          ${
+            canEditSelected()
+              ? `
+                ${shareActive(clip.share) ? "" : renderShareControl(clip)}
+                <button type="button" class="btn btn-ghost btn-sm clip-destructive" data-clip-delete>Delete</button>
+              `
+              : ""
+          }
         </div>
       </div>
       ${
@@ -2153,8 +2303,19 @@ function handleVideoClick(event) {
     return;
   }
 
-  const meeting = (state.meetings || []).find((item) => item.id === state.selectedId);
+  const meeting = selectedMeeting();
   if (!meeting) return;
+
+  const shareMeeting = event.target.closest("[data-share-meeting]");
+  if (shareMeeting) {
+    void setMeetingVisibility(meeting, shareMeeting.dataset.shareMeeting);
+    return;
+  }
+
+  // Seeking above is the only thing a reader may do. Everything past here mutates the
+  // meeting, and on a teammate's shared meeting the server answers 404 — so it is
+  // refused here too rather than sending a request that cannot succeed.
+  if (!canEditMeeting(meeting)) return;
 
   const recordToggle = event.target.closest("[data-video-toggle]");
   if (recordToggle) {

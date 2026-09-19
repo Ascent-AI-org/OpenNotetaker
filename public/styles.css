@@ -2765,3 +2765,74 @@ details.section-fold > .fold-body {
     grid-column: 1 / -1;
   }
 }
+
+/* ---------- Team sharing: whose meeting this is ---------- */
+
+.list-scope {
+  display: flex;
+  gap: 2px;
+  padding: 6px 4px 2px;
+}
+
+.list-scope-tab {
+  flex: 1;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: var(--r-control);
+  background: transparent;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.list-scope-tab:hover {
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+.list-scope-tab.active {
+  background: var(--surface-2);
+  color: var(--ink-1);
+  font-weight: 600;
+}
+
+.list-empty-note {
+  padding: 18px 10px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+/* The owner's name on a row, and the quiet counterpart on your own shared meetings. */
+.card-tag {
+  display: inline-block;
+  max-width: 14ch;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 10.5px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
+.meeting-card-sub:empty {
+  display: none;
+}
+
+.card-tag.subtle {
+  background: transparent;
+  color: var(--ink-3);
+  padding-left: 0;
+}
+
+.prop-chip.shared-by {
+  border-style: dashed;
+  color: var(--ink-2);
+}

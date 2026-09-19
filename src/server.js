@@ -48,6 +48,13 @@ import { buildActionItemsEmail } from "./domain/action-items-email.js";
 import { SlidingWindowRateLimiter } from "./domain/rate-limit.js";
 import { JsonStore } from "./storage/json-store.js";
 import { UsersStore, publicUser } from "./storage/users-store.js";
+import {
+  canReadMeeting,
+  isMeetingOwner,
+  meetingVisibility,
+  parseVisibility,
+  visibleMeetingsFor
+} from "./domain/meeting-visibility.js";
 import { copyRecordingArtifacts, finalizeRawTranscript, runNotetakerJob } from "./domain/pipeline.js";
 import {
   buildLease,
@@ -876,10 +883,8 @@ async function route(request, response) {
       // what balloons this response once a meeting history builds up, and only
       // one meeting's transcript is ever shown at a time. The client fetches the
       // full meeting (GET /api/meetings/:id) when a card is opened.
-      meetings: store
-        .listMeetings()
-        .filter((meeting) => meeting.ownerId === user.id)
-        .map(summarizeMeeting)
+      meetings: visibleMeetingsFor(store.listMeetings(), user)
+        .map((meeting) => forViewer(meeting, user, summarizeMeeting))
     });
   }
 
@@ -897,7 +902,7 @@ async function route(request, response) {
 
     const meeting = await store.createMeeting({ ...validation.value, ownerId: user.id });
     // validateMeetingInput drops unknown fields, so the opt-out is read off the raw body.
-    return sendJson(response, 201, { meeting: publicMeeting(await applyVideoDefaults(meeting, body.recordVideo)) });
+    return sendJson(response, 201, { meeting: forViewer(await applyVideoDefaults(meeting, body.recordVideo)) }, user);
   }
 
   // POST rather than a GET download link: the selection payload is unbounded, and every
@@ -954,9 +959,9 @@ async function route(request, response) {
   if (meetingMatch && request.method === "GET") {
     const user = await requireUser(request, response);
     if (!user) return;
-    const meeting = getOwnedMeeting(meetingMatch[1], user);
+    const meeting = getReadableMeeting(meetingMatch[1], user);
     if (!meeting) return sendJson(response, 404, { error: "not_found" });
-    return sendJson(response, 200, { meeting: publicMeeting(meeting) });
+    return sendJson(response, 200, { meeting: forViewer(meeting, user) });
   }
 
   // The opt-out for a meeting that never passed through the create dialog. A calendar
@@ -970,6 +975,28 @@ async function route(request, response) {
     if (!meeting) return sendJson(response, 404, { error: "not_found" });
 
     const body = await readJsonBody(request);
+
+    // Sharing with the team is the owner's call, at any point in the meeting's life: a
+    // finished meeting is exactly the one worth sharing, so this is deliberately not
+    // fenced behind status === "scheduled" the way the recording toggle below is.
+    if (body.visibility !== undefined) {
+      const visibility = parseVisibility(body.visibility);
+      if (!visibility.ok) {
+        return sendJson(response, 400, { error: "validation_error", message: visibility.message });
+      }
+      if (meetingVisibility(meeting) === visibility.value) {
+        return sendJson(response, 200, { meeting: forViewer(meeting, user) });
+      }
+      const shared = await store.updateMeeting(meeting.id, { visibility: visibility.value });
+      await store.appendEvent(meeting.id, {
+        type: visibility.value === "team" ? "meeting.shared" : "meeting.unshared",
+        message: visibility.value === "team"
+          ? `Shared with the team by ${user.email}.`
+          : `Made private again by ${user.email}.`
+      });
+      return sendJson(response, 200, { meeting: forViewer(shared, user) });
+    }
+
     if (typeof body.recordVideo !== "boolean") {
       return sendJson(response, 400, {
         error: "validation_error",
@@ -1001,7 +1028,7 @@ async function route(request, response) {
       type: body.recordVideo ? "video.enabled" : "video.disabled",
       message: `Video recording turned ${body.recordVideo ? "on" : "off"} by ${user.email}.`
     });
-    return sendJson(response, 200, { meeting: publicMeeting(updated) });
+    return sendJson(response, 200, { meeting: forViewer(updated, user) });
   }
 
   const startMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/start$/);
@@ -1024,7 +1051,7 @@ async function route(request, response) {
     if (meeting.status === "failed" && capturedSegments.length > 0) {
       refinalizeMeeting(meeting, capturedSegments);
       return sendJson(response, 202, {
-        meeting: publicMeeting(store.getMeeting(meeting.id)),
+        meeting: forViewer(store.getMeeting(meeting.id), user),
         message: "Re-running notes from the captured transcript."
       });
     }
@@ -1032,7 +1059,7 @@ async function route(request, response) {
     startMeetingJob(meeting);
 
     return sendJson(response, 202, {
-      meeting: publicMeeting(store.getMeeting(meeting.id)),
+      meeting: forViewer(store.getMeeting(meeting.id), user),
       message: "Notetaker job started."
     });
   }
@@ -1058,7 +1085,7 @@ async function route(request, response) {
 
     const before = meeting.artifacts.notes.actionItems || [];
     if (!actionItemsChanged(before, parsed.value)) {
-      return sendJson(response, 200, { meeting: publicMeeting(meeting), changed: false });
+      return sendJson(response, 200, { meeting: forViewer(meeting), changed: false }, user);
     }
 
     const updated = await store.updateMeeting(meeting.id, {
@@ -1070,7 +1097,7 @@ async function route(request, response) {
       type: "notes.action_items_edited",
       message: `Action items edited by ${user.email}: ${before.length} → ${parsed.value.length}.`
     });
-    return sendJson(response, 200, { meeting: publicMeeting(store.getMeeting(meeting.id)), changed: true });
+    return sendJson(response, 200, { meeting: forViewer(store.getMeeting(meeting.id)), changed: true }, user);
   }
 
   // Recipients and the hold/cancel switch for this meeting's action-item email.
@@ -1102,7 +1129,7 @@ async function route(request, response) {
     }
 
     const updated = await updateActionItemsDelivery(meeting.id, patch);
-    return sendJson(response, 200, { meeting: publicMeeting(updated) });
+    return sendJson(response, 200, { meeting: forViewer(updated) }, user);
   }
 
   // Send now, ignoring any hold.
@@ -1123,7 +1150,7 @@ async function route(request, response) {
 
     try {
       const delivery = await emailActionItems(meeting, { manual: true, overrideRecipients });
-      return sendJson(response, 200, { meeting: publicMeeting(store.getMeeting(meeting.id)), delivery });
+      return sendJson(response, 200, { meeting: forViewer(store.getMeeting(meeting.id)), delivery }, user);
     } catch (error) {
       return sendJson(response, 400, { error: "email_failed", message: error.message });
     }
@@ -1145,7 +1172,7 @@ async function route(request, response) {
     try {
       const delivery = await emailMeetingTranscript(meeting, { manual: true, force: true });
       return sendJson(response, 200, {
-        meeting: publicMeeting(store.getMeeting(meeting.id)),
+        meeting: forViewer(store.getMeeting(meeting.id), user),
         delivery
       });
     } catch (error) {
@@ -1297,7 +1324,7 @@ async function route(request, response) {
       message: `Notes sent to ${sentTo} (${sentSections})${failedClause}.`
     });
     return sendJson(response, 200, {
-      meeting: publicMeeting(updated),
+      meeting: forViewer(updated, user),
       delivery: updated.delivery.notesEmail
     });
   }
@@ -1309,7 +1336,7 @@ async function route(request, response) {
   if (meetingVideoMatch && ["GET", "HEAD"].includes(request.method)) {
     const user = await requireUser(request, response);
     if (!user) return;
-    const meeting = getOwnedMeeting(meetingVideoMatch[1], user);
+    const meeting = getReadableMeeting(meetingVideoMatch[1], user);
     if (!meeting || meeting.video?.status !== "ready") return sendJson(response, 404, { error: "not_found" });
     return serveMediaFile(request, response, {
       resolvePath: () => mediaStore.recordingPath(meeting.id),
@@ -1428,23 +1455,23 @@ async function route(request, response) {
     });
     return sendJson(response, 201, {
       clip: publicClip(clip),
-      meeting: publicMeeting(store.getMeeting(meeting.id))
+      meeting: forViewer(store.getMeeting(meeting.id), user)
     });
   }
 
   if (clipsMatch && request.method === "GET") {
     const user = await requireUser(request, response);
     if (!user) return;
-    const meeting = getOwnedMeeting(clipsMatch[1], user);
+    const meeting = getReadableMeeting(clipsMatch[1], user);
     if (!meeting) return sendJson(response, 404, { error: "not_found" });
     return sendJson(response, 200, { clips: (meeting.clips || []).map(publicClip) });
   }
 
   const clipMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/clips\/([^/]+)$/);
   if (clipMatch && ["GET", "HEAD"].includes(request.method)) {
-    const owned = await requireOwnedClip(request, response, clipMatch);
-    if (!owned) return;
-    const { meeting, clip } = owned;
+    const readable = await requireReadableClip(request, response, clipMatch);
+    if (!readable) return;
+    const { meeting, clip } = readable;
     return serveMediaFile(request, response, {
       resolvePath: () => mediaStore.clipPath(meeting.id, clip.id),
       extraHeaders: PRIVATE_MEDIA_HEADERS
@@ -1467,7 +1494,7 @@ async function route(request, response) {
       type: "video.clip_deleted",
       message: `Clip deleted by ${user.email} (${formatMb(bytesFreed)} freed).`
     });
-    return sendJson(response, 200, { meeting: publicMeeting(store.getMeeting(meeting.id)), bytesFreed });
+    return sendJson(response, 200, { meeting: forViewer(store.getMeeting(meeting.id)), bytesFreed }, user);
   }
 
   const clipShareMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/clips\/([^/]+)\/share$/);
@@ -2423,6 +2450,15 @@ function isSameOrigin(request) {
   }
 }
 
+// Reads only. A meeting its owner shared with the team answers here, and the same 404
+// still covers "missing", "private", and "owner deleted" so a shared-or-not guess cannot
+// be made from the status code.
+function getReadableMeeting(id, user) {
+  const meeting = store.getMeeting(id);
+  if (!canReadMeeting(meeting, user)) return null;
+  return meeting;
+}
+
 function getOwnedMeeting(id, user) {
   const meeting = store.getMeeting(id);
   // 404 for both "missing" and "not yours": existence must not leak across tenants.
@@ -3040,6 +3076,20 @@ function featuresPayload() {
   };
 }
 
+// A meeting as ONE viewer should see it: whose it is, and whether this viewer may act on
+// it. Teammates only ever reach a meeting through the list and the detail route, so this
+// is where the owner's identity is attached — the client has no other way to name them,
+// since the user directory is admin-only.
+function forViewer(meeting, user, serialize = publicMeeting) {
+  const owner = meeting?.ownerId ? users.getUser(meeting.ownerId) : null;
+  return {
+    ...serialize(meeting),
+    visibility: meetingVisibility(meeting),
+    isMine: isMeetingOwner(meeting, user),
+    owner: owner ? { id: owner.id, name: owner.name || "", email: owner.email } : null
+  };
+}
+
 function publicMeeting(meeting) {
   if (!meeting) return meeting;
   return { ...meeting, clips: (meeting.clips || []).map(publicClip) };
@@ -3074,9 +3124,19 @@ function findClip(meeting, clipId) {
 // shape requireUser uses — and the 404 is deliberately identical for a clip that is not
 // yours and one that does not exist.
 async function requireOwnedClip(request, response, match) {
+  return requireClip(request, response, match, getOwnedMeeting);
+}
+
+// Playback of a clip on a meeting its owner shared with the team. Cutting, deleting and
+// sharing a clip still go through requireOwnedClip.
+async function requireReadableClip(request, response, match) {
+  return requireClip(request, response, match, getReadableMeeting);
+}
+
+async function requireClip(request, response, match, lookup) {
   const user = await requireUser(request, response);
   if (!user) return null;
-  const meeting = getOwnedMeeting(match[1], user);
+  const meeting = lookup(match[1], user);
   const clip = meeting ? findClip(meeting, match[2]) : null;
   if (!clip) {
     sendJson(response, 404, { error: "not_found" });
