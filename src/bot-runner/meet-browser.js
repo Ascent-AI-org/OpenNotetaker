@@ -15,7 +15,8 @@ export class MeetBrowserBot {
     aloneTimeoutMs = 45_000,
     scheduledStartAt = "",
     admissionGraceMs = 10 * 60_000,
-    noShowGraceMs = 10 * 60_000
+    noShowGraceMs = 10 * 60_000,
+    cdpCommandTimeoutMs = 20_000
   }) {
     this.meetUrl = meetUrl;
     // Every Meet state-detection regex below matches English UI strings, so force the
@@ -47,6 +48,9 @@ export class MeetBrowserBot {
     this.cdpSocket = null;
     this.cdpPending = new Map();
     this.cdpMessageId = 0;
+    // Chrome can drop a DevTools reply (seen when Meet redirects the tab cross-origin).
+    // Without a bound, one lost reply parks the single-flight worker forever.
+    this.cdpCommandTimeoutMs = Math.max(1000, Number(cdpCommandTimeoutMs) || 20_000);
   }
 
   // How long to keep waiting for admission after clicking Ask to join / Join now.
@@ -234,7 +238,7 @@ export class MeetBrowserBot {
     while (Date.now() < deadline) {
       lastState = await this.inspectRawCdpMeeting();
       if (lastState.status === "admitted") return;
-      if (lastState.status === "refused") throw new Error(lastState.message);
+      if (lastState.status === "refused" || lastState.status === "left_meet") throw new Error(lastState.message);
       await delay(1500);
     }
     throw new Error(`Timed out waiting for Google Meet to admit the bot account. Last state: ${lastState?.status || "unknown"}.`);
@@ -251,7 +255,14 @@ export class MeetBrowserBot {
 
     const id = ++this.cdpMessageId;
     this.cdpSocket.send(JSON.stringify({ id, method, params }));
-    const response = await new Promise((resolveResponse) => this.cdpPending.set(id, resolveResponse));
+    let timer;
+    const response = await new Promise((resolveResponse, reject) => {
+      this.cdpPending.set(id, resolveResponse);
+      timer = setTimeout(() => {
+        this.cdpPending.delete(id);
+        reject(new Error(`Chrome DevTools did not answer ${method} within ${this.cdpCommandTimeoutMs}ms.`));
+      }, this.cdpCommandTimeoutMs);
+    }).finally(() => clearTimeout(timer));
     if (response.error) {
       throw new Error(response.error.message || `Chrome DevTools command failed: ${method}.`);
     }
@@ -272,6 +283,7 @@ export class MeetBrowserBot {
   joinStepScript() {
     return `
       (() => {
+        ${offMeetGuardSnippet()}
         const body = document.body?.innerText || "";
         const normalizedBody = body.toLowerCase();
         const buttons = [...document.querySelectorAll("button")];
@@ -339,6 +351,7 @@ export class MeetBrowserBot {
   inspectMeetingScript() {
     return `
       (() => {
+        ${offMeetGuardSnippet()}
         ${this.signalsHelperSnippet()}
         const body = document.body?.innerText || "";
         const lines = body.split("\\n").map((line) => line.trim()).filter(Boolean);
@@ -528,7 +541,7 @@ export class MeetBrowserBot {
     while (Date.now() < deadline) {
       lastState = await this.inspectAppleScriptMeeting();
       if (lastState.status === "admitted") return;
-      if (lastState.status === "refused") throw new Error(lastState.message);
+      if (lastState.status === "refused" || lastState.status === "left_meet") throw new Error(lastState.message);
       await delay(1500);
     }
     throw new Error(`Timed out waiting for Google Meet to admit the bot account. Last state: ${lastState?.status || "unknown"}.`);
@@ -714,7 +727,7 @@ export class MeetBrowserBot {
     while (Date.now() < deadline) {
       if (page.isClosed()) return "page_closed";
       const state = await this.inspectPlaywrightMeeting();
-      if (state.status === "ended") return "meeting_ended";
+      if (state.status === "ended" || state.status === "left_meet") return "meeting_ended";
       if (state.status === "refused") throw new Error(state.message);
       if (state.status === "alone") {
         aloneSince ??= Date.now();
@@ -744,7 +757,7 @@ export class MeetBrowserBot {
         throw error;
       }
 
-      if (state.status === "ended") return "meeting_ended";
+      if (state.status === "ended" || state.status === "left_meet") return "meeting_ended";
       if (state.status === "refused") throw new Error(state.message);
       if (state.status === "alone") {
         aloneSince ??= Date.now();
@@ -775,7 +788,7 @@ export class MeetBrowserBot {
         throw error;
       }
 
-      if (state.status === "ended") return "meeting_ended";
+      if (state.status === "ended" || state.status === "left_meet") return "meeting_ended";
       if (state.status === "refused") throw new Error(state.message);
       if (state.status === "alone") {
         aloneSince ??= Date.now();
@@ -930,6 +943,20 @@ export function aloneDeadlineMs({
   const shortDeadline = aloneSinceMs + aloneTimeoutMs;
   if (sawOthers || !Number.isFinite(scheduledStartMs)) return shortDeadline;
   return Math.max(shortDeadline, scheduledStartMs + noShowGraceMs);
+}
+
+// Meet sends a guest it will not seat to a non-Meet page (seen in prod: the Workspace
+// marketing page). No text check matches there, so without this the bot waits on it.
+export function offMeetGuardSnippet() {
+  return `
+    if (location.hostname !== "meet.google.com") {
+      return {
+        status: "left_meet",
+        message: "Google Meet sent the bot away from the call to " + location.hostname +
+          ". The meeting may have ended, or it may not let guests join."
+      };
+    }
+  `;
 }
 
 function withEnglishUiParam(meetUrl) {

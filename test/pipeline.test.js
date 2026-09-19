@@ -1646,9 +1646,9 @@ test("detects Calendar read-only scope on saved Google OAuth tokens", () => {
   assert.equal(tokenHasScope({ scope: "https://www.googleapis.com/auth/gmail.send" }, CALENDAR_READONLY_SCOPE), false);
 });
 
-function runInspectMeetingScript(bot, { body, buttons, selectors = {} }) {
+function runInspectMeetingScript(bot, { body, buttons, selectors = {}, hostname = "meet.google.com" }) {
   const document = fakeDocument({ body, buttons, selectors });
-  return Function("document", `"use strict"; return (${bot.inspectMeetingScript()});`)(document);
+  return Function("document", "location", `"use strict"; return (${bot.inspectMeetingScript()});`)(document, { hostname });
 }
 
 function runCollectSignalsScript(bot, { selectors = {} } = {}) {
